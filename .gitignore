@@ -26,3 +26,11 @@ survey.md
 # Node
 node_modules/
 npm-debug.log*
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/

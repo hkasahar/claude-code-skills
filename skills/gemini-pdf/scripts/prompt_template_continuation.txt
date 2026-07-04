@@ -1,0 +1,46 @@
+This is a CONTINUATION of an academic paper that has already been partially converted to Markdown. Do NOT add a title, authors, abstract, or any preamble. Begin your output with the first section heading in this chunk.
+
+Follow these rules strictly:
+
+## Structure
+- Use ## for main sections, ### for subsections, #### for sub-subsections.
+- Preserve the original section numbering if present (e.g., "## 7. Conclusion" not "## Conclusion").
+
+## Mathematics
+- Reconstruct ALL mathematical expressions as LaTeX.
+- Use $...$ for inline math and $$...$$ for display math.
+- Use \begin{align}...\end{align} for multi-line equations with alignment.
+- Number equations only if the original paper numbers them: use \tag{N}.
+- Fix common OCR errors in math: 0↔O, 1↔l↔I, rn↔m, fi↔fi ligature, β↔/3, θ↔0, ε↔e, α↔a, γ↔y, σ↔o, μ↔u, π↔n, Σ↔E, ∈↔e, ≤↔<, ≥↔>, →↔->, ×↔x.
+- Use standard LaTeX commands: \hat, \tilde, \bar, \mathbf, \boldsymbol, \mathcal, \mathbb.
+- Matrices: use \begin{pmatrix} or \begin{bmatrix} as appropriate.
+
+## Theorems and Proofs
+- Format as: **Theorem N.** (or Lemma, Proposition, Corollary, Assumption, Definition, Remark)
+- Italicize the statement body.
+- Proofs: start with **Proof.** and end with a blank line.
+
+## Tables
+- Reconstruct as proper Markdown tables with | column | separators |.
+- Include a header row and separator row (|---|---|).
+- Preserve all numerical values exactly.
+- Add a caption line above: **Table N.** Description
+
+## Figures
+- Replace with: **[Figure N: caption text]** as a placeholder.
+- Preserve any figure notes below.
+
+## Bibliography / References
+- Format each entry as a hanging paragraph.
+- Preserve author names, year, title, journal, volume, pages.
+- Use consistent formatting: Author(s) (Year). "Title." *Journal*, Volume(Issue), pages.
+
+## Footnotes
+- Convert to inline Markdown footnotes: text[^N] ... [^N]: footnote content.
+
+## General
+- Remove page numbers, headers, footers, and running titles.
+- Remove any watermarks or "Downloaded from..." lines.
+- Fix hyphenation artifacts from line breaks (recon-\nstruct → reconstruct).
+- Preserve paragraph breaks. Do not merge separate paragraphs.
+- Do NOT add any commentary, preamble, or explanation. Output ONLY the converted Markdown.

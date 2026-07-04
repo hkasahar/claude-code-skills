@@ -159,7 +159,7 @@ claude setup-token
 **As a plugin (recommended).** Inside Claude Code:
 
 ```text
-/plugin marketplace add hkasahar/claude-code-delegate
+/plugin marketplace add hkasahar/claude-code-skills
 /plugin install delegate@kasahara-skills
 ```
 
@@ -168,16 +168,16 @@ Then **restart Claude Code** (or `/reload-plugins`) so it loads.
 If the shorthand doesn't resolve, use the full URL form:
 
 ```text
-/plugin marketplace add https://github.com/hkasahar/claude-code-delegate.git
+/plugin marketplace add https://github.com/hkasahar/claude-code-skills.git
 /plugin install delegate@kasahara-skills
 ```
 
 **Or copy it manually** (no auto-updates):
 
 ```bash
-git clone https://github.com/hkasahar/claude-code-delegate.git
+git clone https://github.com/hkasahar/claude-code-skills.git
 mkdir -p ~/.claude/skills/delegate
-cp -R claude-code-delegate/skills/delegate/* ~/.claude/skills/delegate/
+cp -R claude-code-skills/skills/delegate/* ~/.claude/skills/delegate/
 ```
 
 ---
