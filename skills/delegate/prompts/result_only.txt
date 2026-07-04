@@ -1,0 +1,5 @@
+Return ONLY the final corrected artifact. No explanation, no reasoning trace,
+no commentary, no status line. Just the deliverable itself, ready to paste
+into the source file.
+If you cannot produce a correct result, return exactly one line:
+FAILED — [one sentence reason]

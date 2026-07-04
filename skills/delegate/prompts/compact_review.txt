@@ -1,0 +1,4 @@
+Return your response in EXACTLY this format:
+VERDICT: [PASS|ISSUES|CRITICAL] — [one sentence summary]
+If ISSUES or CRITICAL: list each as "- [file:line] description" (max 10).
+No code rewriting. Just identify problems.

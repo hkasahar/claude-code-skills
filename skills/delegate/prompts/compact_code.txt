@@ -1,0 +1,5 @@
+Return your response in EXACTLY this format:
+STATUS: [DONE|FAILED|PARTIAL] — [one sentence describing what was done or what failed]
+CHANGED: [comma-separated list of modified function/section names]
+---
+[changed code blocks only. No unchanged code. No explanation prose.]

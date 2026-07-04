@@ -1,0 +1,4 @@
+Return your response in EXACTLY this format:
+VERDICT: [CORRECT|ERROR|GAP] — [one sentence]
+If ERROR or GAP: list the specific step number and the flaw. Be precise.
+Do not restate the proof or derivation.

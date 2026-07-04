@@ -1,0 +1,17 @@
+{
+  "name": "kasahara-skills",
+  "owner": {
+    "name": "hkasahar"
+  },
+  "metadata": {
+    "description": "Claude Code skills for research and orchestration workflows.",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "delegate",
+      "source": "./",
+      "description": "Delegate heavy tasks from Claude Code to Codex CLI and Antigravity CLI: save tokens, run work in parallel, and cross-verify proofs and code across independent models."
+    }
+  ]
+}

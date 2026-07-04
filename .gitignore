@@ -1,0 +1,28 @@
+# macOS / editor cruft
+.DS_Store
+._*
+*.swp
+*~
+
+# Secrets and local config — NEVER commit
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+settings.local.json
+.claude/settings.local.json
+
+# Delegation wrapper outputs and logs (smoke-test / run artifacts)
+*.err
+codex_*.md
+antigravity_*.md
+claude_out.md
+result.md
+survey.md
+*.log
+
+# Node
+node_modules/
+npm-debug.log*
