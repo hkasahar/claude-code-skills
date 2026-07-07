@@ -4,7 +4,7 @@ A small collection of [Claude Code](https://claude.com/claude-code) skills for r
 
 | Skill | What it does |
 |---|---|
-| **[`delegate`](skills/delegate/SKILL.md)** | Offload heavy or token-expensive work from Claude Code to **Codex CLI** (GPT) and **Antigravity CLI** (Gemini), with an optional Claude CLI third voter. Save tokens, run jobs in parallel, and cross-verify across independent models. |
+| **[`delegate`](skills/delegate/SKILL.md)** | Offload heavy or token-expensive work from Claude Code to **Codex CLI** (GPT) and **Antigravity CLI** (Gemini), plus an **independent Claude delegate** (isolated config dir, OAuth token auth) usable as a majority-of-3 third voter or an agentic worker. Save tokens, run jobs in parallel, and cross-verify across independent models. |
 | **[`gemini-pdf`](skills/gemini-pdf/SKILL.md)** | Convert PDFs to clean **Markdown** (LaTeX math, tables, section structure) via Antigravity CLI, with auto-chunking for long papers, a quality-score gate, and an optional Mathpix fallback. |
 
 Both are aimed at researchers — including people new to command-line tools. If you've never used a terminal AI before, start with **[docs/SETUP.md](docs/SETUP.md)**.
@@ -77,7 +77,7 @@ These skills run shell commands and send your prompts/documents to external serv
 - **Review the scripts before running them.** They're short and readable.
 - **Delegation/conversion sends data off your machine** — to OpenAI (Codex) and/or Google (Antigravity). **Do not send confidential, embargoed, or privacy-sensitive material.**
 - **Never paste API keys, tokens, or passwords into a prompt.** Each CLI handles its own sign-in.
-- The Antigravity/Claude wrappers need the sandbox relaxed only so the CLI can bind a local port / read its credential store to authenticate — relax it narrowly, never globally. See each skill's `SKILL.md`.
+- The Antigravity wrapper (directly, or via `ask_both.sh`'s Antigravity leg) needs the sandbox relaxed only so `agy` can bind a local port — relax it narrowly, never globally. `ask_claude.sh` needs no sandbox relaxation (env-token auth; no keychain access). See each skill's `SKILL.md`.
 
 ---
 

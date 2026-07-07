@@ -53,7 +53,7 @@ Tokens are spent reading and writing in the context window — so don't spend th
 For high-stakes claims, one opinion isn't enough:
 
 - **`ask_both.sh`** sends the same prompt to Codex and Antigravity in parallel. Compare the two verdicts. **Agreement** is reassuring; **disagreement halts** the pipeline until you resolve it.
-- When the two disagree, add a **third voter**: `INCLUDE_CLAUDE=1 ask_both.sh …` brings in the Claude CLI for a majority-of-3. (Caveat: the Claude voter shares a model family with the orchestrator, so treat it as mechanical disagreement-detection, not fully independent triangulation.)
+- When the two disagree, add a **third voter**: `INCLUDE_CLAUDE=1 ask_both.sh …` brings in the independent Claude delegate (isolated `~/.claude-delegate` config, zero-tool voter — see the skill's "Independence guarantees" section) for a majority-of-3. (Caveat: the Claude voter shares a model family with the orchestrator, so treat it as mechanical disagreement-detection, not fully independent triangulation.)
 - **You own the final verdict.** The models assist; the human integrates and decides.
 
 ## Verification as the load-bearing idea

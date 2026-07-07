@@ -2,7 +2,8 @@
 name: delegate
 description: >-
   Delegate heavy or token-expensive work from Claude Code to Codex CLI (GPT) and
-  Antigravity CLI (Gemini), with an optional Claude CLI third voter. Use when a task is
+  Antigravity CLI (Gemini), plus an independent Claude Code delegate (isolated config
+  dir, OAuth subscription auth) usable as a 3rd voter or agentic worker. Use when a task is
   large, parallelizable, or benefits from cross-model verification: dispatch a
   self-contained prompt to an external CLI, write its output to a file, and read only the
   STATUS/VERDICT header to keep the main context clean. Good for code implementation,
@@ -13,7 +14,7 @@ description: >-
 
 # Delegate Skill
 
-Orchestrate token-efficient workflows by delegating heavy tasks to **Codex CLI** (`codex`) and **Antigravity CLI** (`agy`), which run on separate subscription quotas at ~$0 marginal cost. An optional **Claude CLI** third voter (via `ask_claude.sh`) is available for vote-based flows (e.g. a majority-of-3 verification).
+Orchestrate token-efficient workflows by delegating heavy tasks to **Codex CLI** (`codex`) and **Antigravity CLI** (`agy`), which run on separate subscription quotas at ~$0 marginal cost. An independent **Claude Code delegate** (via `ask_claude.sh`) runs under an isolated config dir (`~/.claude-delegate`) on OAuth subscription auth, providing a 3rd voter for majority-of-3 vote flows and an agentic worker mode symmetric with the Codex leg.
 
 The core discipline: dispatch a self-contained prompt to an external CLI, write its output to a file, then read only the first few lines (a `STATUS:`/`VERDICT:` header) instead of pasting the whole result into context. On success this costs ~15–50 tokens instead of thousands.
 
@@ -21,7 +22,15 @@ The core discipline: dispatch a self-contained prompt to an external CLI, write 
 
 - **Antigravity CLI** installed and authenticated (`agy` on PATH; install: `curl -fsSL https://antigravity.google/cli/install.sh | bash`)
 - **Codex CLI** installed and authenticated (`codex` on PATH; install: `npm install -g @openai/codex`)
-- **Claude CLI** installed and authenticated for headless use (`claude setup-token`, or set `ANTHROPIC_API_KEY`). Only needed for the optional 3rd voter (`ask_claude.sh`).
+- **Claude Code CLI** installed. Only needed for `ask_claude.sh` (3rd voter / agentic worker). The delegate runs under an ISOLATED config dir (`~/.claude-delegate` by default, override: `CLAUDE_DELEGATE_CONFIG_DIR`), independent of your main session's config (default `~/.claude`). One-time setup — **run in a regular terminal, NOT via `!` inside a Claude Code session** (the long-lived token must never enter argv, shell history, or a session transcript, which memory plugins may index):
+
+  ```bash
+  CLAUDE_CONFIG_DIR=~/.claude-delegate claude setup-token   # browser flow, prints an sk-ant-oat… token
+  umask 077
+  cat > ~/.claude-delegate/oauth_token    # paste token, Enter, Ctrl-D
+  ```
+
+  Rationale (verified 2026-07-07 on Claude Code 2.1.198): `--bare` **cannot** be used for OAuth delegation — bare-mode auth is strictly `ANTHROPIC_API_KEY`/apiKeyHelper ("OAuth and keychain are never read") — so the wrapper passes an explicit `CLAUDE_CODE_OAUTH_TOKEN` env token (honored without `--bare`; takes precedence over keychain credentials) and replicates `--bare`'s hygiene mechanically: fresh config dir (no hooks/plugins/memory/user CLAUDE.md), throwaway mktemp cwd in voter mode, `--tools ""`, `--no-session-persistence`. Authenticating `~/.claude-delegate` against a second subscription (optional) isolates quota from your main session; with the same account, config/process/cwd isolation still holds but quota is shared. (Env-token auth also sidesteps a macOS caveat: `CLAUDE_CONFIG_DIR` does not namespace the macOS Keychain, so keychain-based logins may be shared across profiles.)
 - All CLIs must support non-interactive/headless mode.
 
 New here? See [`docs/SETUP.md`](../../docs/SETUP.md) for step-by-step install and authentication, and [`docs/WORKFLOW.md`](../../docs/WORKFLOW.md) for how this skill fits the orchestrate-and-verify workflow.
@@ -51,7 +60,7 @@ ls "$DELEGATE/prompts/"                 # compact_code.txt, compact_verify.txt, 
 1. Pass `dangerouslyDisableSandbox: true` on the Bash tool call, or
 2. Run from a shell outside the Claude Code sandbox.
 
-The same applies to `claude -p` (the 3rd voter): it works once `claude setup-token` has been run AND the wrapper is dispatched with sandbox disabled.
+`claude -p` (via `ask_claude.sh`) does **not** need the sandbox disabled: auth is an explicit env token (no keychain), and full voter + agentic dispatches (including `~/.claude-delegate` session writes and `--resume`) were verified working under the default sandbox on 2026-07-07.
 
 > **⚠️ Security — read before disabling the sandbox.** `dangerouslyDisableSandbox: true` lets the delegation CLI reach the network and your credential store (it needs both to authenticate and call the model API). Only disable the sandbox for these specific delegation calls — never as a blanket setting — and never delegate a prompt built from untrusted input. Also note that **delegating sends your prompt, and any file content you paste into it, to the external provider** (OpenAI for Codex, Google for Antigravity). Do not delegate confidential, embargoed, or privacy-sensitive material. See `docs/SETUP.md` for the full security checklist.
 
@@ -65,7 +74,7 @@ CLI interfaces change quickly. **Re-verify quarterly** via `codex --version` / `
 |---|---|---|---|---|
 | Codex | `gpt-5.5` | `low \| medium \| high \| xhigh` (per `codex debug models`; `minimal` is **not** in the `gpt-5.5` catalog) | `-c model_reasoning_effort=xhigh` (passed via `-c` config override on `codex exec`) | `CODEX_MODEL`, `CODEX_EFFORT` |
 | Antigravity | `gemini-3.1-pro` (logically — see note) | n/a | **none exposed at CLI level** (agy v1.0.0 has NO `--model` flag); model is configured via `~/.gemini/antigravity-cli/settings.json` or the `agy /model` interactive command | `ANTIGRAVITY_MODEL` (informational only — recorded in metadata header; **not** passed to the binary) |
-| Claude SDK (optional 3rd voter) | `opus` alias → `claude-opus-4-7` | `low \| medium \| high \| xhigh \| max` (passed via `--effort`) | `--effort max` (default in wrapper) | `CLAUDE_MODEL`, `CLAUDE_EFFORT` |
+| Claude Code (delegate: 3rd voter + agentic worker; verified 2026-07-07) | `opus` alias → latest Claude Opus (4.8 as of 2026-07) | `low \| medium \| high \| xhigh \| max` | `--effort max` if the installed CLI advertises the flag; otherwise omitted (feature-detected via `claude --help`) | `CLAUDE_DELEGATE_MODEL`, `CLAUDE_DELEGATE_EFFORT`, `CLAUDE_DELEGATE_CONFIG_DIR` |
 
 ### Default invocation = best model, max effort
 
@@ -73,18 +82,47 @@ CLI interfaces change quickly. **Re-verify quarterly** via `codex --version` / `
 
 `ask_antigravity.sh` does **not** pass a `--model` flag (agy v1.0.0 doesn't have one). The model is whatever the user has set in `~/.gemini/antigravity-cli/settings.json`. For math-heavy / proof-verification workloads, set the model to `Gemini 3.1 Pro (High)` via the interactive `agy /model` command. `ANTIGRAVITY_MODEL` is recorded in the wrapper's metadata header for provenance but is not passed to the binary.
 
-`ask_claude.sh` defaults to model `opus` (resolves to the latest Claude Opus) with `--effort max` and `--tools ""` (disables all tool use — voting is pure judgment). The script also passes `--bare` to skip CLAUDE.md auto-discovery, giving the 3rd voter fresh context.
+`ask_claude.sh` defaults to model `opus` (resolves to the latest Claude Opus) with `--effort max` (feature-detected). Voter mode disables all tool use with `--tools ""` — verified present on 2.1.198 and **fail-closed**: the wrapper hard-errors rather than dispatch a vote if a future CLI drops the flag — plus `--permission-mode dontAsk` as a backstop (`dontAsk` alone would still allow read-only tools), `--strict-mcp-config` (MCP tools are NOT governed by `--tools ""`), `--no-session-persistence`, and `--max-turns 1`. It does **not** pass `--bare` (which would break OAuth auth — see Prerequisites); context-freedom comes from the fresh delegate config dir and a throwaway mktemp cwd. Wrapper knobs use the `CLAUDE_DELEGATE_*` namespace because an orchestrating Claude Code session ambiently exports `CLAUDE_EFFORT` (and other `CLAUDE_CODE_*` vars) into every Bash child — un-namespaced knobs would silently inherit the orchestrator's values. Because the voter has zero file access, it will **confabulate** plausible-looking content (even fake tool transcripts) if asked about local files — always paste the material to be judged directly into the prompt; never ask the voter to "read" anything.
 
 ### Independence caveat (3rd voter)
 
-The Claude SDK 3rd voter shares the model family with the orchestrating Claude Code session. Vote independence is mechanically preserved (3 distinct dispatches), but **statistically reduced** vs. using a third model from a different provider. Use this for mechanical disagreement detection, not as a true triangulation against the orchestrator's biases.
+The Claude 3rd voter shares the model family with the orchestrating Claude Code session. Vote independence is mechanically preserved (3 distinct dispatches), but **statistically reduced** vs. using a third model from a different provider. Use this for mechanical disagreement detection, not as a true triangulation against the orchestrator's biases.
+
+### Independence guarantees (Claude-from-Claude)
+
+`ask_claude.sh` enforces independence on four axes:
+
+1. **Config**: `CLAUDE_CONFIG_DIR=~/.claude-delegate` — own auth, settings, session store. No contention with the orchestrating session; optionally a separate subscription. Keep this dir free of `CLAUDE.md`/memory (the wrapper WARNs if one appears).
+2. **Process**: ALL `CLAUDECODE*`/`CLAUDE_CODE_*` harness vars are unset in the child — an orchestrating session ambiently exports `CLAUDE_CODE_SESSION_ID`, `CLAUDE_CODE_EFFORT_LEVEL`, and more (measured 2026-07-07), which would otherwise alter the delegate's behavior. `CLAUDE_DELEGATE_DEPTH` blocks delegate-of-delegate recursion (depth ≥ 1 fails fast).
+3. **Auth**: explicit env token, priority token file > inherited `CLAUDE_CODE_OAUTH_TOKEN` (stderr WARN — orchestrator's token, independence degraded) > `ANTHROPIC_API_KEY` **opt-in only** (`CLAUDE_DELEGATE_ALLOW_API_KEY=1`; an orchestrating session exports a metered API key ambiently, so an unguarded fallback would silently bill the API). Per the documented CLI auth precedence, `ANTHROPIC_API_KEY` **outranks** `CLAUDE_CODE_OAUTH_TOKEN` (and `ANTHROPIC_AUTH_TOKEN` outranks both), so the wrapper unsets `ANTHROPIC_API_KEY` whenever an OAuth token is selected and drops `ANTHROPIC_AUTH_TOKEN` unconditionally — subscription billing, never metered. An empty token file is a hard error, not a fallback.
+4. **Cwd**: voter mode runs in a throwaway `mktemp -d` (no project CLAUDE.md pickup, no session-store collisions). Agentic mode requires an explicit `CLAUDE_DELEGATE_WORKDIR` (no `$PWD` fallback). **Honest scope note**: the workdir bounds file tools only — an allowed `Bash` tool is NOT jailed to it, and `--add-dir` widens Edit/Write scope; `dangerouslyDisableSandbox: true` on the dispatch removes the last containment layer. Treat agentic prompts as trusted code. The delegate token is readable by the delegatee by design (same user/host).
+
+The statistical caveat above stands: config/process/auth/cwd independence is mechanical, not statistical.
+
+### Claude delegate environment variables
+
+All knobs live in the `CLAUDE_DELEGATE_*` namespace (legacy `CLAUDE_MODEL`/`CLAUDE_EFFORT`/`CLAUDE_TIMEOUT`/`CLAUDE_AGENTIC`/… are **ignored** — an orchestrating session ambiently exports `CLAUDE_EFFORT` etc. into Bash children, which would silently hijack un-namespaced knobs):
+
+| Var | Default | Meaning |
+|---|---|---|
+| `CLAUDE_DELEGATE_CONFIG_DIR` | `~/.claude-delegate` | Child's `CLAUDE_CONFIG_DIR` |
+| `CLAUDE_DELEGATE_MODEL` | `opus` | Model alias/name |
+| `CLAUDE_DELEGATE_EFFORT` | `max` | Effort tier (feature-detected `--effort`) |
+| `CLAUDE_DELEGATE_TIMEOUT` | `570` | Internal timeout, seconds — deliberately under the Bash tool's 600s default cap so the wrapper's timeout classification fires before a harness kill (see Timeout Configuration) |
+| `CLAUDE_DELEGATE_AGENTIC` | `0` | `1` = agentic worker; else voter |
+| `CLAUDE_DELEGATE_WORKDIR` | — | **Required in agentic mode** (hard error if unset) |
+| `CLAUDE_DELEGATE_ALLOWED_TOOLS` | `Read,Grep,Glob,Edit,Write,Bash` | Agentic `--allowedTools` |
+| `CLAUDE_DELEGATE_MAX_TURNS` | 1 voter / 40 agentic | Turn cap; quota guardrail. Applied via a runtime parser probe — `--max-turns` exists on 2.1.198 but is **hidden from `--help`**. Wrapper WARNs if a future CLI drops the flag |
+| `CLAUDE_DELEGATE_RESUME` | unset | Session ID for `--resume`; **agentic-only** (hard error in voter mode) |
+| `CLAUDE_DELEGATE_ADD_DIRS` | unset | Colon-separated extra `--add-dir` paths (agentic) |
+| `CLAUDE_DELEGATE_ALLOW_API_KEY` | `0` | `1` permits metered `ANTHROPIC_API_KEY` fallback |
 
 ### When to override the defaults
 
 - **Cheaper / faster verifications**: `CODEX_EFFORT=high bash ask_codex.sh ...` (drops one tier).
 - **Probing alternative models**: `CODEX_MODEL=gpt-5.4 bash ask_codex.sh ...`.
 - **Switch Antigravity model**: edit `~/.gemini/antigravity-cli/settings.json` (model field is a display string like "Gemini 3.1 Pro (High)"); the wrapper does not change this.
-- **Switch Claude model**: `CLAUDE_MODEL=sonnet bash ask_claude.sh ...` (faster/cheaper alternative for the 3rd voter; not recommended for high-stakes votes).
+- **Switch Claude model**: `CLAUDE_DELEGATE_MODEL=sonnet bash ask_claude.sh ...` (faster/cheaper alternative for the 3rd voter; not recommended for high-stakes votes).
 
 ### How to refresh this section
 
@@ -123,6 +161,29 @@ Note: `codex exec --help` does **not** list `model_reasoning_effort` — the val
 - **Mechanical LaTeX** — booktabs tables, pgfplots, TikZ (`result_only.txt`)
 - **Regex, SQL, awk construction** (`result_only.txt`)
 
+### Delegate to Claude agentic worker (`CLAUDE_DELEGATE_AGENTIC=1 ask_claude.sh`) when:
+- The task needs Claude-quality reasoning AND file access, but not the orchestrator's context (e.g., self-contained LaTeX refactors, test suites, formalization in a scratch repo)
+- Parallel Claude workers are wanted on a second subscription's quota
+- Codex is quota-exhausted and the task is code-heavy
+
+```bash
+# Isolated workdir is REQUIRED (use a git worktree for parallel dispatches)
+git -C ~/proj worktree add /tmp/wt-fix HEAD
+CLAUDE_DELEGATE_AGENTIC=1 CLAUDE_DELEGATE_WORKDIR=/tmp/wt-fix \
+  bash "$DELEGATE/scripts/ask_claude.sh" @task.md result.md
+head -3 result.md    # metadata + STATUS; session= in the header enables follow-ups
+```
+
+Multi-turn follow-up (must use the same workdir; session lookup is cwd-scoped):
+
+```bash
+SID=$(sed -n 's/.*session=\([^ ]*\).*/\1/p; 1q' result.md)
+CLAUDE_DELEGATE_AGENTIC=1 CLAUDE_DELEGATE_WORKDIR=/tmp/wt-fix CLAUDE_DELEGATE_RESUME=$SID \
+  bash "$DELEGATE/scripts/ask_claude.sh" "Now add unit tests" result2.md
+```
+
+Treat agentic prompts as trusted code: the worker runs `--permission-mode acceptEdits` with pre-approved tools, and an allowed `Bash` is not jailed to the workdir (see Independence guarantees, axis 4). Keep in Claude Code (do NOT delegate to the agentic worker): anything needing the orchestrator's accumulated context, MEMORY.md/CLAUDE.md-dependent edits, secrets, or destructive operations — same exclusions as the "Keep in Claude Code" list below.
+
 ### Keep in Claude Code when:
 - Orchestration decisions (what to delegate, what to do next)
 - Final integration of results from Codex/Antigravity
@@ -152,7 +213,7 @@ Use `$DELEGATE/prompts/result_only.txt` when you want only the corrected artifac
 
 Read with:
 ```bash
-head -1 result.md          # check for FAILED line; otherwise paste directly
+head -3 result.md          # metadata header + FAILED sentinel line (line 3) if any; otherwise paste the body
 ```
 
 ### Template 1: Compact code fix (default for routine Codex tasks)
@@ -214,6 +275,8 @@ No format constraint. Use `cat result.md`. Reserve for:
 
 **Never** `cat` a successful compact result. The STATUS/VERDICT line tells you everything you need.
 
+`ask_claude.sh` provenance: the output body is the parsed `.result` from `--output-format json`; the metadata comment records `mode= model= effort= auth= session= cost_usd= turns=`. The raw JSON envelope is preserved at `${output%.md}.json` for forensics — never `cat` it on success. (`auth=token-file` confirms subscription billing; `cost_usd` is informational only.)
+
 ---
 
 ## Usage Patterns
@@ -242,7 +305,9 @@ INCLUDE_CLAUDE=1 bash $DELEGATE/scripts/ask_both.sh \
     "$PROMPT" antigravity_out.md codex_out.md claude_out.md
 head -3 antigravity_out.md codex_out.md claude_out.md
 # Majority-of-3 vote; INCLUDE_CLAUDE=1 makes Claude failure FATAL (caller opts in for vote semantics).
-# Independence caveat: Claude shares model family with the orchestrator — see Models & Reasoning Effort.
+# The claude leg runs as a context-free voter under ~/.claude-delegate (pinned — inherited
+# CLAUDE_DELEGATE_AGENTIC/RESUME cannot leak in). Independence caveat: Claude shares model
+# family with the orchestrator — see Models & Reasoning Effort.
 ```
 
 ### Pattern 3a: Codex compact (routine code fix)
@@ -268,7 +333,7 @@ cat result.md              # worth it when root cause is unknown
 PROMPT="Rewrite the bootstrap_ci() function in sim.R to use BCa intervals instead of percentile.
 $(cat $DELEGATE/prompts/result_only.txt)"
 bash $DELEGATE/scripts/ask_codex.sh "$PROMPT" result.md
-head -1 result.md          # check for FAILED; otherwise paste the artifact
+head -3 result.md          # FAILED sentinel sits on line 3 (after the metadata header); otherwise paste the artifact
 ```
 
 ### Pattern 7: Parallel Codex batch (3+ independent tasks)
@@ -276,6 +341,7 @@ head -1 result.md          # check for FAILED; otherwise paste the artifact
 Write prompt files first, then create a manifest referencing them:
 ```bash
 # Write prompt files
+mkdir -p /tmp/claude
 cat > /tmp/claude/p1.md << 'EOF'
 Implement compute_bootstrap_ci() in R that takes a numeric vector and returns
 BCa confidence intervals. Include: bias correction, acceleration estimate.
@@ -336,28 +402,28 @@ When writing prompts for Codex/Antigravity/Claude, include:
 
 ## Timeout Configuration
 
-**Critical:** The Bash tool's timeout must exceed the delegation script's timeout, or the script will be killed before it can finish.
+**Critical:** The Bash tool's timeout must exceed the delegation script's internal timeout, or the script is killed before it can write its `STATUS: FAILED` envelope — the caller then sees a hard tool kill instead of a classified failure.
 
 | Script | Default Internal Timeout | Recommended Bash `timeout` |
 |--------|-------------------------|---------------------------|
-| `ask_antigravity.sh` | 1200s (`ANTIGRAVITY_TIMEOUT` env) | `timeout: 1200000` |
-| `ask_codex.sh`  | 1200s (`CODEX_TIMEOUT` env)  | `timeout: 1200000` |
-| `ask_claude.sh` | 1200s (`CLAUDE_TIMEOUT` env) | `timeout: 1200000` |
-| `ask_both.sh`   | 1200s (inherits from above)  | `timeout: 1200000` |
-| `ask_codex_batch.sh` | 1200s (`BATCH_TIMEOUT` env) | `timeout: 1200000` |
+| `ask_antigravity.sh` | 600s (`ANTIGRAVITY_TIMEOUT` env) | `timeout: 600000` |
+| `ask_codex.sh`  | 600s (`CODEX_TIMEOUT` env)  | `timeout: 600000` |
+| `ask_claude.sh` | 570s (`CLAUDE_DELEGATE_TIMEOUT` env) | `timeout: 600000` |
+| `ask_both.sh`   | inherits per leg (600/600/570)  | `timeout: 600000` |
+| `ask_codex_batch.sh` | 580s (`BATCH_TIMEOUT` env; 560s per task) | `timeout: 600000` |
 
-**Always set `timeout: 1200000` (20 min, the Bash tool maximum) when calling delegation scripts.** Even simple Antigravity queries can take 30s+ baseline, and network retries add 2-5 minutes.
+**Always set `timeout: 600000` (10 min — the Bash tool's default maximum) when calling delegation scripts.** Even simple Antigravity queries can take 30s+ baseline, and network retries add 2-5 minutes. `ask_claude.sh` deliberately defaults to 570s so its own timeout classification fires before the 600s harness kill; the agy/codex legs default to 600s, so for guaranteed timeout classification on those, drop their env to ≤570 (e.g. `CODEX_TIMEOUT=570`). For dispatches that need **more** than 10 minutes: raise the script's `*_TIMEOUT` env AND either run the Bash call with `run_in_background: true` (no timeout cap) or raise `BASH_MAX_TIMEOUT_MS` in settings.
 
-**Bash invocation must also pass `dangerouslyDisableSandbox: true`** for `ask_antigravity.sh` and `ask_claude.sh` (both bind localhost TCP ports / access keychain) — see Antigravity sandbox note in Prerequisites.
+**Bash invocation must also pass `dangerouslyDisableSandbox: true`** for `ask_antigravity.sh` — and therefore for **`ask_both.sh`**, whose Antigravity leg otherwise fails every sandboxed cross-verification with "Sandbox blocked agy TCP bind" (and any leg failure makes ask_both exit 1). `ask_claude.sh` alone does **NOT** need it: env-token auth avoids the keychain, and full voter + agentic dispatches were verified working under the default sandbox on 2026-07-07. See Antigravity sandbox note in Prerequisites.
 
 Example:
 ```
-Bash(command="bash $DELEGATE/scripts/ask_antigravity.sh 'your query' output.md", timeout=1200000)
+Bash(command="bash $DELEGATE/scripts/ask_antigravity.sh 'your query' output.md", timeout=600000, dangerouslyDisableSandbox=true)
 ```
 
 To override the internal timeout:
 ```bash
-ANTIGRAVITY_TIMEOUT=900 bash $DELEGATE/scripts/ask_antigravity.sh "long query" output.md
+ANTIGRAVITY_TIMEOUT=570 bash $DELEGATE/scripts/ask_antigravity.sh "long query" output.md
 ```
 
 ---
@@ -370,7 +436,7 @@ When working in agent teams (multiple subagents running in parallel), each teamm
 Orchestrator (team lead)
 ├── Teammate A (general-purpose) → Antigravity CLI (agy)
 ├── Teammate B (general-purpose) → Codex CLI
-├── Teammate C (general-purpose) → ask_both.sh (Antigravity + Codex, optionally + Claude CLI)
+├── Teammate C (general-purpose) → ask_both.sh (Antigravity + Codex, optionally + Claude delegate)
 └── Teammate D (general-purpose)       → local work only
 ```
 
@@ -401,7 +467,7 @@ When spawning teammates that should delegate:
 You have access to external LLM delegation scripts:
 - bash $DELEGATE/scripts/ask_antigravity.sh "prompt" output.md
 - bash $DELEGATE/scripts/ask_codex.sh "prompt" output.md
-- bash $DELEGATE/scripts/ask_claude.sh "prompt" output.md     (optional 3rd voter)
+- bash $DELEGATE/scripts/ask_claude.sh "prompt" output.md     (independent Claude delegate — voter by default)
 - bash $DELEGATE/scripts/ask_both.sh "prompt" agy.md cdx.md
 - INCLUDE_CLAUDE=1 bash $DELEGATE/scripts/ask_both.sh "prompt" agy.md cdx.md cl.md
 
@@ -416,9 +482,12 @@ For 3+ independent Codex tasks, use ask_codex_batch.sh with a manifest file.
 Read head -3 of outputs first; cat only on failure or unknown errors.
 Include full context in prompts (external CLIs cannot see project files).
 Defaults: gpt-5.5 + xhigh effort (Codex); gemini-3.1-pro (Antigravity, via agy);
-          claude-opus-4-7 + effort max (Claude SDK, optional 3rd voter via ask_claude.sh).
+          opus (latest Opus) + effort max (Claude delegate under ~/.claude-delegate,
+          OAuth token auth; overrides use the CLAUDE_DELEGATE_* namespace).
 See "Models & Reasoning Effort" section for env-var overrides.
-Bash invocation: pass `dangerouslyDisableSandbox: true` for ask_antigravity.sh and ask_claude.sh.
+Bash invocation: pass `dangerouslyDisableSandbox: true` for ask_antigravity.sh AND ask_both.sh
+(the agy TCP-bind requirement propagates through ask_both's antigravity leg).
+ask_claude.sh alone runs fine under the default sandbox (verified 2026-07-07).
 ```
 
 ### Concurrency Note

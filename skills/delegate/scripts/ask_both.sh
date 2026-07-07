@@ -18,15 +18,22 @@
 #   bash ask_both.sh @research/verify_prop3.md research/agy_verify.md research/codex_verify.md
 #
 # Environment variables:
-#   ANTIGRAVITY_TIMEOUT  Timeout for Antigravity in seconds (default: 600)
-#   CODEX_TIMEOUT        Timeout for Codex in seconds (default: 600)
-#   CLAUDE_TIMEOUT       Timeout for Claude in seconds (default: 600)
+#   ANTIGRAVITY_TIMEOUT      Timeout for Antigravity in seconds (default: 600)
+#   CODEX_TIMEOUT            Timeout for Codex in seconds (default: 600)
+#   CLAUDE_DELEGATE_TIMEOUT  Timeout for Claude in seconds (default: 570)
 #   INCLUDE_CLAUDE       Set to "1" to also dispatch to Claude in parallel.
 #                        When set, Claude failure is FATAL (exit 1) — callers opt in because
 #                        they need majority-of-3 semantics; silent degradation to 2-voter
 #                        would corrupt downstream vote logic.
 #   DELEGATE_DIR         Directory containing ask_antigravity.sh, ask_codex.sh, ask_claude.sh
 #                        (default: same directory as this script)
+#
+# Claude leg: runs under the isolated delegate config dir (~/.claude-delegate by
+# default; see ask_claude.sh) with OAuth token-file auth, and is PINNED to voter
+# mode — CLAUDE_DELEGATE_AGENTIC/CLAUDE_DELEGATE_RESUME are overridden at dispatch
+# so a caller-exported agentic/resume var can never turn a majority-of-3 vote into
+# a write-capable agent or trip the voter-resume guard. Other CLAUDE_DELEGATE_*
+# vars (MODEL, EFFORT, TIMEOUT, CONFIG_DIR) propagate normally.
 
 set -euo pipefail
 
@@ -42,17 +49,17 @@ ANTIGRAVITY_OUT="${2:-${TMPDIR:-/tmp}/claude/antigravity_cross_$(date +%s)_$$.md
 CODEX_OUT="${3:-${TMPDIR:-/tmp}/claude/codex_cross_$(date +%s)_$$.md}"
 CLAUDE_OUT="${4:-${TMPDIR:-/tmp}/claude/claude_cross_$(date +%s)_$$.md}"
 
-# Detect a legacy 4-arg call: if a 4th arg is passed WITHOUT INCLUDE_CLAUDE=1,
+# Detect legacy 4-arg Oracle pattern: if user passes a 4th arg WITHOUT INCLUDE_CLAUDE=1,
 # warn and ignore (catches stale callers).
 if [[ -n "${4:-}" && "${INCLUDE_CLAUDE:-}" != "1" ]]; then
     echo "[delegate/both] WARN: 4th argument provided ('$4') but INCLUDE_CLAUDE!=1. Ignoring." >&2
-    echo "[delegate/both]       (An earlier version accepted a 4th output arg; that path has been removed.)" >&2
+    echo "[delegate/both]       (Legacy ask_both.sh accepted oracle_out as 4th arg; Oracle has been removed.)" >&2
 fi
 
 # Empty prompt guard
 if [[ -z "$QUERY" ]]; then
     echo "Usage: ask_both.sh \"prompt\" [antigravity_out.md] [codex_out.md] [claude_out.md]" >&2
-    echo "  Set INCLUDE_CLAUDE=1 to also dispatch to Claude (3rd voter for majority-of-3 votes)" >&2
+    echo "  Set INCLUDE_CLAUDE=1 to also dispatch to Claude (3rd voter for majority-of-3)" >&2
     exit 1
 fi
 
@@ -85,18 +92,25 @@ echo "[delegate/both] Starting parallel cross-verification..." >&2
 echo "[delegate/both]   Antigravity → ${ANTIGRAVITY_OUT}" >&2
 echo "[delegate/both]   Codex       → ${CODEX_OUT}" >&2
 
-# Launch primary 2 legs in parallel
-bash "$ASK_ANTIGRAVITY" "$QUERY" "$ANTIGRAVITY_OUT" &
+# Launch primary 2 legs in parallel. Leg stdout goes to /dev/null: each wrapper
+# echoes its own output path on completion, which would otherwise pollute THIS
+# script's documented stdout contract (exactly the 2-3 path lines at the end)
+# in nondeterministic completion order. Leg stderr passes through for progress.
+bash "$ASK_ANTIGRAVITY" "$QUERY" "$ANTIGRAVITY_OUT" >/dev/null &
 ANTIGRAVITY_PID=$!
 
-bash "$ASK_CODEX" "$QUERY" "$CODEX_OUT" &
+bash "$ASK_CODEX" "$QUERY" "$CODEX_OUT" >/dev/null &
 CODEX_PID=$!
 
 # Optionally launch Claude (3rd voter)
 CLAUDE_PID=""
 if [[ "${INCLUDE_CLAUDE:-}" == "1" ]]; then
     echo "[delegate/both]   Claude      → ${CLAUDE_OUT}" >&2
-    bash "$ASK_CLAUDE" "$QUERY" "$CLAUDE_OUT" &
+    # Pin voter mode: never let inherited CLAUDE_DELEGATE_AGENTIC/RESUME leak into
+    # a vote dispatch (agentic 3rd voter would corrupt vote semantics; a stray
+    # RESUME would trip the wrapper's voter guard and, being FATAL here, kill the
+    # whole 3-way vote). ask_claude.sh treats empty RESUME as unset.
+    CLAUDE_DELEGATE_AGENTIC=0 CLAUDE_DELEGATE_RESUME= bash "$ASK_CLAUDE" "$QUERY" "$CLAUDE_OUT" >/dev/null &
     CLAUDE_PID=$!
 fi
 

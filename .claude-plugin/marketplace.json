@@ -5,15 +5,15 @@
   },
   "metadata": {
     "description": "Claude Code skills for research and orchestration workflows.",
-    "version": "0.2.0"
+    "version": "0.3.0"
   },
   "plugins": [
     {
       "name": "delegate",
       "source": "./",
       "strict": false,
-      "description": "Delegate heavy or token-expensive tasks from Claude Code to Codex CLI (GPT) and Antigravity CLI (Gemini), with an optional Claude CLI third voter. Write output to a file and read only the STATUS/VERDICT header to keep the main context clean.",
-      "version": "0.1.0",
+      "description": "Delegate heavy or token-expensive tasks from Claude Code to Codex CLI (GPT) and Antigravity CLI (Gemini), plus an independent Claude delegate (isolated config dir, OAuth token auth) usable as a majority-of-3 third voter or an agentic worker. Write output to a file and read only the STATUS/VERDICT header to keep the main context clean.",
+      "version": "0.2.0",
       "license": "MIT",
       "homepage": "https://github.com/hkasahar/claude-code-skills",
       "keywords": [
