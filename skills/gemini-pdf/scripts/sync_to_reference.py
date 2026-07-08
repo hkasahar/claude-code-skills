@@ -6,13 +6,9 @@ Two modes:
     python3 sync_to_reference.py --key KEY --pdf /path/to.pdf --md /path/to.md \
         [--sidecar /path/to.json] [--central-ref /path/to/reference]
 
-  Batch (process a directory of already-downloaded papers):
+  Batch (sync a whole project reference folder at once):
     python3 sync_to_reference.py --batch --ref-dir /path/to/project/ref/ \
         [--central-ref /path/to/reference]
-
-The central reference library is OPT-IN: pass --central-ref, or set the
-GEMINI_PDF_REFERENCE_DIR environment variable. If neither is set, this script
-does nothing (it will not write to the current directory).
 
 All operations are skip-if-exists (no overwrites, no duplicates).
 Exit codes: 0 = success, 1 = error.
@@ -29,14 +25,14 @@ from datetime import datetime
 # Opt-in: no default path. Resolve from --central-ref or GEMINI_PDF_REFERENCE_DIR.
 DEFAULT_CENTRAL_REF = os.environ.get("GEMINI_PDF_REFERENCE_DIR")
 
-# Book-type BibTeX keys (shared formatting logic)
+# Copied from generate_bib.py — keep in sync
 BOOK_KEYS = {
     "coverandthomas2006", "hall1980martingale", "rao1973",
     "tsybakov2009", "vaart1998", "lattimore2020bandit", "stewart1990",
 }
 
 
-# --- Author formatting (shared BibTeX formatting logic) ---
+# --- Author formatting (copied from generate_bib.py — keep in sync) ---
 
 def format_author_bibtex(name):
     """Format author name for BibTeX. Handle particles like 'van der Vaart'."""
@@ -101,6 +97,60 @@ def load_bib_keys(bib_path):
     pattern = re.compile(r'^@\w+\{([^,\s]+)\s*,', re.MULTILINE)
     with open(bib_path) as f:
         return set(pattern.findall(f.read()))
+
+
+def parse_front_matter(md_path):
+    """Parse a YAML-ish front matter block from a converted Markdown file.
+
+    Deliberately minimal (no PyYAML dependency): accepts only a leading block
+    delimited by `---` lines containing plain `key: value` pairs. Authors may
+    be a single line with `;`/` and ` separators. Malformed blocks are
+    rejected (empty dict) rather than guessed at.
+
+    Returns a metadata dict shaped like the JSON sidecar:
+    {"title": str, "authors": [str, ...], "year": str, "venue": str, "doi": str}
+    """
+    allowed_keys = {"title", "authors", "year", "journal", "venue", "doi"}
+    try:
+        with open(md_path, encoding="utf-8", errors="replace") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return {}
+
+    # Skip leading blank lines; block must start with a bare ---
+    i = 0
+    while i < len(lines) and not lines[i].strip():
+        i += 1
+    if i >= len(lines) or lines[i].strip() != "---":
+        return {}
+
+    meta = {}
+    for j in range(i + 1, min(i + 30, len(lines))):
+        line = lines[j]
+        if line.strip() == "---":
+            break
+        m = re.match(r"^([A-Za-z_]+)\s*:\s*(.*)$", line)
+        if not m:
+            return {}  # malformed block: reject rather than guess
+        key, value = m.group(1).lower(), m.group(2).strip().strip('"').strip("'")
+        if key not in allowed_keys or not value:
+            continue
+        # BibTeX-hostile characters are stripped defensively; the md is
+        # derived from an untrusted PDF.
+        value = value.replace("{", "").replace("}", "").replace("\\", "")
+        if key == "authors":
+            parts = re.split(r";| and ", value)
+            authors = [p.strip() for p in parts if p.strip()]
+            if authors:
+                meta["authors"] = authors
+        elif key == "journal":
+            meta["venue"] = value
+        else:
+            meta[key] = value
+    else:
+        return {}  # no closing --- within the window: reject
+
+    return meta
 
 
 def load_sidecar(key, pdf_path, sidecar_path, central_ref):
@@ -246,8 +296,14 @@ def find_sidecar_in_dir(ref_dir, key):
 
 # --- Main sync functions ---
 
-def sync_single(key, pdf_path, md_path, central_ref, sidecar_path=None, bib_keys_cache=None):
+def sync_single(key, pdf_path, md_path, central_ref, sidecar_path=None, bib_keys_cache=None,
+                force=False):
     """Sync a single paper to the central reference library.
+
+    All copies are skip-if-exists unless force=True, which overwrites the
+    PDF/MD copies (escape hatch for re-converted papers whose earlier, worse
+    conversion already occupies the library slot). The bib entry is never
+    replaced once its key exists.
 
     Returns dict with actions taken.
     """
@@ -264,9 +320,9 @@ def sync_single(key, pdf_path, md_path, central_ref, sidecar_path=None, bib_keys
 
     # 1. Copy PDF
     if pdf_path and os.path.isfile(pdf_path):
-        if os.path.isfile(pdf_dest):
+        if samefile_safe(pdf_path, pdf_dest):
             actions["skipped"].append("pdf")
-        elif samefile_safe(pdf_path, pdf_dest):
+        elif os.path.isfile(pdf_dest) and not force:
             actions["skipped"].append("pdf")
         else:
             shutil.copy2(pdf_path, pdf_dest)
@@ -283,9 +339,9 @@ def sync_single(key, pdf_path, md_path, central_ref, sidecar_path=None, bib_keys
 
     # 2. Copy MD
     if md_path and os.path.isfile(md_path):
-        if os.path.isfile(md_dest):
+        if samefile_safe(md_path, md_dest):
             actions["skipped"].append("md")
-        elif samefile_safe(md_path, md_dest):
+        elif os.path.isfile(md_dest) and not force:
             actions["skipped"].append("md")
         else:
             shutil.copy2(md_path, md_dest)
@@ -300,6 +356,12 @@ def sync_single(key, pdf_path, md_path, central_ref, sidecar_path=None, bib_keys
 
     if not key_exists:
         metadata = load_sidecar(key, pdf_path, sidecar_path, central_ref)
+        if not metadata and md_path and os.path.isfile(md_path):
+            # No JSON sidecar anywhere: fall back to the converted MD's own
+            # front matter (the sidecar remains authoritative when present).
+            metadata = parse_front_matter(md_path)
+            if metadata:
+                print(f"[sync] Metadata from MD front matter for {key}", file=sys.stderr)
         entry = build_bib_entry(key, metadata)
         backup_bib_if_needed(central_ref)
         atomic_append_bib(bib_path, entry)
@@ -369,19 +431,11 @@ def main():
                         help="Batch mode: sync all PDFs from --ref-dir")
     parser.add_argument("--ref-dir", help="Reference directory for batch mode")
     parser.add_argument("--central-ref", default=DEFAULT_CENTRAL_REF,
-                        help="Central reference library path "
-                             "(opt-in; or set GEMINI_PDF_REFERENCE_DIR)")
+                        help="Central reference library path (opt-in; or set GEMINI_PDF_REFERENCE_DIR)")
+    parser.add_argument("--force", action="store_true",
+                        help="Overwrite existing PDF/MD copies (bib entries are never replaced)")
 
     args = parser.parse_args()
-
-    # Opt-in guard: without an explicit central-ref, do nothing. This prevents
-    # abspath("")/abspath(None) from resolving to the current directory and
-    # creating pdf/, md/, reference.bib there.
-    if not args.central_ref:
-        print("[sync] No central reference library set; skipping "
-              "(pass --central-ref or set GEMINI_PDF_REFERENCE_DIR to enable).",
-              file=sys.stderr)
-        return 0
 
     if args.batch:
         if not args.ref_dir:
@@ -390,14 +444,25 @@ def main():
         if not os.path.isdir(args.ref_dir):
             print(f"ERROR: ref-dir not found: {args.ref_dir}", file=sys.stderr)
             return 1
+        if not args.central_ref:
+            print("[sync] No central reference library configured — skipping "
+                  "(pass --central-ref or set GEMINI_PDF_REFERENCE_DIR to enable).",
+                  file=sys.stderr)
+            return 0
         sync_batch(os.path.abspath(args.ref_dir), os.path.abspath(args.central_ref))
     elif args.key:
+        if not args.central_ref:
+            print("[sync] No central reference library configured — skipping "
+                  "(pass --central-ref or set GEMINI_PDF_REFERENCE_DIR to enable).",
+                  file=sys.stderr)
+            return 0
         sync_single(
             key=args.key,
             pdf_path=args.pdf,
             md_path=args.md,
             central_ref=os.path.abspath(args.central_ref),
             sidecar_path=args.sidecar,
+            force=args.force,
         )
     else:
         print("ERROR: Provide --key for single mode or --batch for batch mode",

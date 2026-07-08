@@ -1,24 +1,23 @@
 ---
 name: gemini-pdf
-description: Convert PDF files to clean Markdown using Antigravity CLI (`agy`). Best for academic papers with math, tables, and structured content. Two-stage pipeline (markitdown → agy) produces LaTeX math, proper headings, and formatted tables. Auto-chunks long papers to handle the model's output token limit. Zero marginal cost via a Google subscription. Triggers include "convert PDF to markdown with Antigravity", "agy PDF conversion", "PDF to markdown with math", and "convert paper to markdown".
+description: Convert PDF files to clean Markdown using Antigravity CLI (`agy`). Best for academic papers with math, tables, and structured content. The native pipeline feeds page-range chunk PDFs directly to Gemini's vision pathway (agy reads the PDF itself — no lossy text extraction), with an automatic quality-gated fallback to a Mathpix hybrid and Mathpix standalone. Zero marginal cost via a Google subscription. Triggers include "convert PDF to markdown with Antigravity", "agy PDF conversion", "PDF to markdown with math", and "convert paper to markdown".
 ---
 
 # PDF-to-Markdown Conversion (via Antigravity CLI)
 
-> **Note**: The skill folder is named `gemini-pdf` for backward compatibility with the `/gemini-pdf` slash command. Internally it now drives Antigravity CLI (`agy`), Google's successor to the original Gemini CLI.
+> **Note**: The skill folder is named `gemini-pdf` for backward compatibility with the `/gemini-pdf` slash command. Internally it drives Antigravity CLI (`agy`), Google's successor to the original Gemini CLI.
 
 ## When to Use
 
-- Academic papers with mathematical notation (reconstructs LaTeX)
-- Papers with complex tables, theorems, proofs
-- When markitdown alone produces garbled math or broken structure
-- Zero-cost conversion via Google One AI Premium (no API keys)
+- Academic papers with mathematical notation (LaTeX reconstructed from the rendered page)
+- Papers with complex tables, theorems, proofs, or two-column layouts
+- Scanned PDFs (the native vision pathway OCRs them; the Mathpix fallback also handles them)
+- Zero-cost conversion via a Google One AI subscription (no API keys for the primary path)
 
 ## When NOT to Use
 
-- **Simple text-only PDFs** → `markitdown` alone is sufficient
-- **Need exact LaTeX source** → ask the author or use Mathpix
-- **Very large documents (>1.5M tokens)** → split into chapters first
+- **Need exact LaTeX source** → ask the author or use Mathpix directly
+- **Enormous documents (>500 pages)** → split into chapters first (hard page ceiling)
 
 ## Locating the script
 
@@ -37,22 +36,21 @@ fi
 ## Quick Usage
 
 ```bash
-# Basic: outputs paper.md alongside paper.pdf
+# Basic: native pipeline, outputs paper.md alongside paper.pdf
 bash "$GEMINI_PDF/scripts/pdf_to_markdown.sh" paper.pdf
 
 # Specify output path
 bash "$GEMINI_PDF/scripts/pdf_to_markdown.sh" paper.pdf /tmp/output.md
 
-# Use pdftotext instead of markitdown for extraction
-bash "$GEMINI_PDF/scripts/pdf_to_markdown.sh" paper.pdf output.md --extractor pdftotext
-
-# Disable auto-chunking (force single-pass even for long papers)
-bash "$GEMINI_PDF/scripts/pdf_to_markdown.sh" paper.pdf --no-chunk
-
-# Force Mathpix conversion (skip Antigravity entirely)
+# Choose a pipeline explicitly
+bash "$GEMINI_PDF/scripts/pdf_to_markdown.sh" paper.pdf --pipeline text
+bash "$GEMINI_PDF/scripts/pdf_to_markdown.sh" paper.pdf --hybrid
 bash "$GEMINI_PDF/scripts/pdf_to_markdown.sh" paper.pdf --force-mathpix
 
-# Disable Mathpix fallback (`agy` output only, regardless of quality)
+# Disable auto-chunking (single agy pass over the whole PDF)
+bash "$GEMINI_PDF/scripts/pdf_to_markdown.sh" paper.pdf --no-chunk
+
+# Disable the quality-gated fallback chain
 bash "$GEMINI_PDF/scripts/pdf_to_markdown.sh" paper.pdf --no-fallback
 
 # Custom quality threshold (default: 60)
@@ -61,147 +59,125 @@ bash "$GEMINI_PDF/scripts/pdf_to_markdown.sh" paper.pdf --quality-threshold 40
 
 ## Architecture
 
-Two-stage pipeline that avoids shell ARG_MAX limits:
+### Native pipeline (default)
+
+`agy` reads the PDF **directly** through Gemini's vision/document pathway — math layout, column order, and table geometry are seen as rendered, not guessed back from lossy text extraction:
 
 ```
-markitdown paper.pdf | agy --print-timeout 600s --print "FORMAT_PROMPT" > output.md
+pdfinfo → page count P
+P ≤ 10 → single chunk (whole PDF)
+P > 10 → split_pdf_pages.py → chunk PDFs of ≤ 10 pages (1-indexed inclusive ranges)
+for each chunk SEQUENTIALLY (global agy lock):
+    isolated temp dir containing only that chunk PDF
+    agy --model "$MODEL" --add-dir <dir> --print-timeout <T>s -p "<prompt>"
+    validate (nonce end-sentinel + ratio guards) → retry → bisect on repeated failure
+concatenate → quality gates → sanitize → output.md
 ```
 
-1. **Stage 1 — Text extraction**: `markitdown` (default) or `pdftotext` extracts raw text from PDF
-2. **Stage 2 — Intelligent formatting**: Text is piped via stdin to Antigravity CLI (`agy --print`), which reformats it into clean Markdown with proper LaTeX math, section hierarchy, tables, and bibliography
+- The first chunk's prompt produces YAML front matter (`title/authors/year/journal/doi`) **plus** the `# Title` heading; continuation chunks follow a seam protocol (transcribe from the first character of the page, resume exactly after the previous chunk's tail — provided as read-only context — never skip, never repeat).
+- Failed/truncated chunks are retried once, then recursively bisected down to single pages before a `<!-- CHUNK N FAILED -->` placeholder is accepted.
+- Prompts instruct the model to flag unreadable passages as `<!-- UNCERTAIN: ... -->` rather than guess — a flagged gap always beats fluent fabrication.
+
+### Concurrency constraint (hard, probe-verified)
+
+Two concurrent `agy --print` processes **hang** (0 bytes output, both ignore their own `--print-timeout`; verified live 2026-07-07 on agy 1.0.16, plain and with `--new-project`). Consequently:
+
+- All agy calls run strictly sequentially under a global lock (`$TMPDIR/gemini-pdf-agy.lock`); concurrent script invocations serialize automatically.
+- Every agy call is wrapped in an external watchdog (`TIMEOUT+60s`) that kills the **whole process group** and sweeps orphans — agy's own timeout cannot be trusted under contention.
+- `agy --sandbox` also hangs the native read (probe-verified) and is not used.
+
+### Fallback chain (auto, quality-gated)
+
+```
+native ──eligible & ≥threshold──→ done
+   │ low
+   ▼
+hybrid: mathpix --mode extract → agy structural cleanup (math preserved verbatim)
+   │ low
+   ▼
+mathpix standalone → best eligible attempt wins
+```
+
+Winner selection is two-stage: **eligibility gates** first (no failed chunks, fidelity floors, completeness floor), then comparison on **literalness-neutral** dimensions only (math quality, structure, OCR, failed chunks) — recall-vs-source dimensions would unfairly reward the most literal attempt. A later stage must beat an earlier one by ≥5 points to displace it. Losing attempts are kept as `output.attempt-<stage>.md`.
+
+Degraded environments: agy missing → Mathpix standalone (the text pipeline needs agy too); poppler missing → text pipeline with markitdown; pypdf missing → poppler page splitter.
 
 ### Model configuration
 
-Antigravity CLI v1.0+ has **no `--model` flag**. The model is configured in `~/.gemini/antigravity-cli/settings.json` (key: `"model"`). For math-heavy PDFs, set the model to **"Gemini 3.1 Pro (High)"** — either interactively via the `/model` command inside `agy`, or by editing the settings file directly:
+`agy` ≥ 1.0.5 has a working `--model` flag; the script passes `GEMINI_PDF_MODEL` (default **"Gemini 3.1 Pro (High)"**) on every call and falls back to the `~/.gemini/antigravity-cli/settings.json` model only if the installed agy lacks the flag. List models with `agy models`.
 
-```jsonc
-// ~/.gemini/antigravity-cli/settings.json
-{
-  "model": "Gemini 3.1 Pro (High)",
-  ...
-}
-```
+### Quality verification
 
-For drafts or lighter loads, `"Gemini 3.5 Flash (High)"` is faster but less accurate on dense math. The `GEMINI_PDF_MODEL` env var is retained in the script for documentation/logging but is **not** passed to `agy` — change the settings file to actually switch models.
+`scripts/quality_check.py` scores 0-100 with per-dimension breakdown:
 
-The formatting prompt (`scripts/prompt_template.txt`) handles:
-- Heading hierarchy reconstruction
-- LaTeX math from garbled Unicode
-- OCR artifact correction (0↔O, 1↔l, rn↔m, Greek↔Latin)
-- Theorem/proof formatting
-- Table reconstruction
-- Bibliography normalization
+| Dimension | Weight (with source text) | Checks |
+|-----------|--------------------------|--------|
+| Content completeness | 20% | raw output vs source-text ratio (band 0.5–2.0) |
+| Math quality | 20% | balanced `$`/`$$` (currency-aware), well-formed LaTeX |
+| Structural integrity | 15% | title, sections, bibliography, tables, theorem markers |
+| OCR artifacts | 10% | replacement chars, garbled runs, ligatures |
+| Failed chunks | 10% | any failure hard-caps the overall score at ≤50 |
+| Numeric fidelity | 15% | recall of source numerals (boilerplate/page-number filtered) |
+| Trigram recall | 10% | recall of source prose trigrams (normalized) |
 
-### Auto-Chunking (for long papers)
+Plus: `comparison_score` (literalness-neutral, for cross-attempt selection), `eligible` + reasons, UNCERTAIN-marker count (small penalty), and front-matter detection. Corrupted PDF text layers (some 1990s journal PDFs encode `.` as `+` or `(` as `Ž`) are detected automatically and the source-dependent dimensions are skipped — recall against a garbled reference would punish a *correct* conversion. Without source text, a legacy five-dimension weighting applies. Non-mathematical documents redistribute the math weight adaptively.
 
-Papers exceeding `GEMINI_PDF_CHUNK_THRESHOLD` chars (default 50K, ~15 pages) are automatically split to work around the model's ~14K output token limit per response:
+### Sanitization
 
-```
-markitdown paper.pdf → extracted text
-  ↓
-  if text < 50K chars → single-pass (unchanged)
-  ↓
-  if text ≥ 50K chars → split at section boundaries → group into ≤100K char chunks
-  ↓
-  chunk 1 → agy (full prompt)         → output part 1
-  chunk 2 → agy (continuation prompt) → output part 2
-  chunk N → agy (continuation prompt) → output part N
-  ↓
-  concatenate → final output.md
-```
+Converted Markdown originates from an untrusted PDF; `scripts/sanitize_md.py` strips `<script>`/`<iframe>`/`<object>` blocks, HTML event-handler attributes, and `javascript:` URLs before any downstream use, reporting every removal.
 
-**Splitting strategy** (three-tier):
-1. **Primary**: split at `^[0-9]+ [A-Z]` lines (major section headers)
-2. **Secondary**: if a single section > 100K chars, sub-split at `^[0-9]+\.[0-9]+ [A-Z]` (subsections)
-3. **Tertiary**: if still oversized, split at paragraph boundaries (blank lines)
+### Optional reference-library sync
 
-Chunks 2+ use `scripts/prompt_template_continuation.txt` which omits title/author instructions to prevent duplicate preambles.
-
-If a chunk fails (timeout or error), a `<!-- CHUNK N FAILED -->` placeholder is inserted and processing continues with remaining chunks.
-
-### Quality Verification
-
-After Antigravity (`agy`) produces output, `scripts/quality_check.py` scores it on a 0-100 scale across five dimensions:
-
-| Dimension | Weight | Checks |
-|-----------|--------|--------|
-| Content completeness | 30% | Output chars vs page count (~2K-12K expected chars/page) |
-| Math quality | 25% | Balanced `$`/`$$` delimiters, well-formed LaTeX commands |
-| Structural integrity | 20% | Title, sections, bibliography, tables, theorem markers |
-| OCR artifact detection | 15% | Unicode replacement chars, garbled consonant runs |
-| Failed chunks | 10% | `<!-- CHUNK N FAILED -->` markers |
-
-**Adaptive weighting**: For non-mathematical PDFs (no equations detected), math weight redistributes to other dimensions.
-
-### Automatic Mathpix Fallback
-
-When quality score falls below threshold (default 60), the pipeline automatically falls back to Mathpix if credentials are available:
-
-```
-agy output → quality_check.py → PASS (≥ threshold): done
-                              → FAIL: check MATHPIX credentials
-                                → Missing: warn, keep agy output
-                                → Present: Mathpix convert
-                                  → quality_check.py → PASS: use Mathpix
-                                                     → FAIL: use Mathpix anyway (best available)
-```
-
-Requires `MATHPIX_APP_ID` and `MATHPIX_APP_KEY` environment variables. Without them, the agy output is kept with a warning. Use `--no-fallback` to disable, or `--force-mathpix` to skip Antigravity entirely.
+**Opt-in and off by default.** When `GEMINI_PDF_REFERENCE_DIR` points to an existing directory (layout: `pdf/`, `md/`, `reference.bib`), the final winner (only — never intermediate attempts) is synced there: with `--bib-key KEY`, PDF → `pdf/KEY.pdf`, MD → `md/KEY.md`, and a BibTeX entry is appended (metadata precedence: JSON sidecar → the MD's own YAML front matter → key-only entry). Copies are skip-if-exists; `--force-sync` overwrites the PDF/MD copies (bib entries are never replaced). Without the env var set, nothing is written outside your output path. See [docs/gemini-pdf.md](../../docs/gemini-pdf.md).
 
 ## Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `GEMINI_PDF_MODEL` | `(read from agy settings.json)` | **Informational only.** `agy` has no `--model` flag; configure model in `~/.gemini/antigravity-cli/settings.json`. |
-| `GEMINI_PDF_TIMEOUT` | `600` (10 min) | Timeout in seconds (per chunk in chunked mode); passed to `agy --print-timeout` as `${TIMEOUT}s` |
-| `GEMINI_PDF_CHUNK_THRESHOLD` | `50000` | Auto-chunk documents exceeding this many chars |
-| `GEMINI_PDF_CHUNK_MAX` | `100000` | Maximum chars per chunk |
-| `GEMINI_PDF_REFERENCE_DIR` | (unset — opt-in) | **Optional.** Central reference library root (`pdf/`, `md/`, `reference.bib`). The reference-sync step is skipped entirely unless this is set to an existing directory. See [docs/gemini-pdf.md](../../docs/gemini-pdf.md#optional-reference-library-sync). |
-| `GEMINI_PDF_QUALITY_THRESHOLD` | `60` | Quality score threshold (0-100) for Mathpix fallback |
+| `GEMINI_PDF_MODEL` | `Gemini 3.1 Pro (High)` | Passed to `agy --model` on every call |
+| `GEMINI_PDF_TIMEOUT` | `600` | Per-chunk timeout (s); watchdog fires at +60s |
+| `GEMINI_PDF_PIPELINE` | `native` | `native` \| `text` \| `hybrid` \| `mathpix` |
+| `GEMINI_PDF_PAGES_PER_CHUNK` | `10` | Native pipeline pages per chunk |
+| `GEMINI_PDF_MAX_PAGES` | `500` | Hard page ceiling (split larger docs first) |
+| `GEMINI_PDF_CHUNK_THRESHOLD` | `50000` | Text pipeline: chunk above this many bytes |
+| `GEMINI_PDF_CHUNK_MAX` | `100000` | Text pipeline: max bytes per chunk |
+| `GEMINI_PDF_QUALITY_THRESHOLD` | `60` | Quality gate for the fallback chain |
 | `GEMINI_PDF_MATHPIX_FALLBACK` | `true` | Enable/disable automatic Mathpix fallback |
-| `MATHPIX_APP_ID` | (none) | Mathpix API app ID (for fallback) |
-| `MATHPIX_APP_KEY` | (none) | Mathpix API app key (for fallback) |
+| `GEMINI_PDF_LOCK_DIR` | `$TMPDIR/gemini-pdf-agy.lock` | Global agy serialization lock |
+| `GEMINI_PDF_REFERENCE_DIR` | (unset — opt-in) | **Optional.** Central reference library root; sync is skipped entirely unless set to an existing directory |
+| `MATHPIX_APP_ID` / `MATHPIX_APP_KEY` | (none) | Mathpix API credentials (hybrid + fallback) |
 
 ## Flags
 
 | Flag | Description |
 |------|-------------|
-| `--extractor markitdown\|pdftotext` | Choose text extraction backend |
-| `--no-chunk` | Disable auto-chunking (force single-pass) |
-| `--bib-key KEY` | Bibtex-style key for central reference copy (e.g., `andrews-1999-ecma`) |
-| `--no-fallback` | Disable Mathpix fallback; keep `agy` output regardless of quality |
-| `--force-mathpix` | Skip Antigravity entirely; use Mathpix for conversion |
-| `--quality-threshold N` | Override quality threshold (default 60) |
+| `--pipeline native\|text\|hybrid\|mathpix` | Choose the conversion pipeline |
+| `--extractor pdftotext\|markitdown` | Text-pipeline extractor (implies `--pipeline text`) |
+| `--no-chunk` | Single agy pass (native: whole PDF; text: no splitting) |
+| `--no-fallback` | Disable the quality-gated fallback chain |
+| `--force-mathpix` | Mathpix standalone (skip agy entirely) |
+| `--hybrid` | Mathpix extraction + agy structural cleanup |
+| `--bib-key KEY` | Sync winner to the reference library under KEY (needs `GEMINI_PDF_REFERENCE_DIR`) |
+| `--force-sync` | Overwrite existing library PDF/MD copies |
+| `--quality-threshold N` | Override quality gate (default 60) |
 
-### Central Reference Sync
+## Output files
 
-**This feature is opt-in and off by default.** It runs only when `GEMINI_PDF_REFERENCE_DIR` points to an existing directory (see [docs/gemini-pdf.md](../../docs/gemini-pdf.md#optional-reference-library-sync)); otherwise it is skipped entirely and nothing is written outside your output path.
-
-When `--bib-key KEY` is provided (and the library is configured), the script syncs to the central reference library:
-- Copies PDF → `reference/pdf/{KEY}.pdf`
-- Copies MD → `reference/md/{KEY}.md`
-- Adds BibTeX entry to `reference/reference.bib` (metadata from JSON sidecar if available)
-- All operations skip-if-exists (no overwrites, no duplicates)
-- Backs up `reference.bib` → `reference.bib.bak` before first modification
-
-Without `--bib-key`, only the MD file is copied (using its filename).
+For `output.md` the script may also write: `output.err` (agy stderr per chunk), `output.meta.json` (per-chunk ledger: page ranges, bytes, retries, status), `output.quality.json` (full quality report), and `output.attempt-<stage>.md` (losing fallback attempts, kept for manual override).
 
 ## Troubleshooting
 
 | Problem | Solution |
 |---------|----------|
 | `agy not found` | `curl -fsSL https://antigravity.google/cli/install.sh \| bash` |
-| `Authentication required` from `agy` | Run `agy` interactively once and complete the OAuth flow; the script can then run unattended |
-| `markitdown not found` | `pip install markitdown` |
-| `ModuleNotFoundError: requests` (Mathpix path) | `pip install requests` |
-| Timeout on large papers | Increase: `GEMINI_PDF_TIMEOUT=1200 bash ...` (passed as `${T}s` to `--print-timeout`) |
-| Math still garbled | (1) confirm model is `Gemini 3.1 Pro (High)` in `~/.gemini/antigravity-cli/settings.json`; (2) try `--extractor pdftotext` |
-| Empty output | Check `.err` file next to output for `agy` errors |
-| Document too large | Split PDF into chapters, convert separately |
-| Output truncated (long paper) | Should auto-chunk now; verify threshold: `GEMINI_PDF_CHUNK_THRESHOLD=30000` |
-| `<!-- CHUNK N FAILED -->` in output | A chunk timed out or errored; increase `GEMINI_PDF_TIMEOUT` and re-run |
-| Too many chunks (slow) | Increase `GEMINI_PDF_CHUNK_MAX=150000` to reduce chunk count |
-| Low quality score | Try `--force-mathpix` or lower `--quality-threshold 40` |
-| Mathpix fallback not triggering | Set `MATHPIX_APP_ID` and `MATHPIX_APP_KEY` env vars |
-| Scanned PDF (no text layer) | Use `--force-mathpix` (Mathpix handles OCR natively) |
-| Wrong model used | `agy` reads model from `~/.gemini/antigravity-cli/settings.json`; `GEMINI_PDF_MODEL` env var is informational only |
+| `Authentication required` from `agy` | Run `agy` interactively once and complete the OAuth flow |
+| Conversion very slow | Chunks run sequentially by design (parallel agy hangs — verified). ~1-4 min/chunk is normal |
+| Another conversion seems stuck | Check the lock: `ls $TMPDIR/gemini-pdf-agy.lock` — stale locks from dead processes are removed automatically |
+| Timeout on a dense chunk | Increase `GEMINI_PDF_TIMEOUT=1200`; the pipeline also auto-bisects failing chunks |
+| `<!-- CHUNK N FAILED -->` in output | That page range failed after retries + bisection; re-run, or convert those pages separately |
+| Math still garbled | Confirm the model: `GEMINI_PDF_MODEL="Gemini 3.1 Pro (High)"`; try `--hybrid` (Mathpix math OCR) |
+| Scanned PDF (no text layer) | Native pipeline handles it (vision); `--force-mathpix` is the alternative |
+| Low quality score | Inspect `output.quality.json`; try `--hybrid` or `--force-mathpix`; lower `--quality-threshold` |
+| Mathpix fallback not triggering | Set `MATHPIX_APP_ID` and `MATHPIX_APP_KEY` |
+| Empty output | Check `output.err` for agy errors |
+| Wrong model used | This agy build may lack `--model` (warning is printed); set it in `~/.gemini/antigravity-cli/settings.json` |
