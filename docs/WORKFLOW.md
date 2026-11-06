@@ -1,76 +1,49 @@
-# The workflow: orchestrate, delegate, verify
+# A research workflow with checkable results
 
-This skill exists to support one working style: **Claude Code as an orchestrator that delegates heavy work to other models and owns the quality gate.** This page distills that workflow, adapted from H. Kasahara, *"Using LLMs and Generative AI for Economics Research"* (2026) (slides: [`llm_research_slides.pdf`](llm_research_slides.pdf)). Everything here is generic — swap in your own tools and skills.
+Use the available agent as the root coordinator. It owns the question, scope, evidence, integration, and final quality gate. Delegate when a bounded worker improves speed or provides useful fresh review. A task does not require every provider.
 
-## The core idea
+## Explore, plan, review, implement
 
-No single model dominates. Each has a comparative advantage:
+1. Inspect the project, branch, instructions, and task ledger. Establish what is already complete.
+2. For substantial work, save a concrete plan: inputs, assumptions, permitted edits, deliverables, checks, and stopping conditions. Clarify choices that change the method or claim.
+3. Obtain fresh review of the actual saved plan before implementation when independent review is requested or the stakes warrant it. Give the reviewer the original request and source artifacts, without a preferred verdict.
+4. Resolve material findings, then implement in a scoped directory. Assign non-overlapping files to concurrent writers.
+5. Review against the request, run proportionate checks, inspect the diff, and report evidence and remaining limits.
 
-- **Claude Code** — agentic orchestration, long-horizon tasks, tool use, and the final judgment call.
-- **Codex (GPT)** — math, computation, simulation, and code.
-- **Antigravity (Gemini)** — very large context: reading and reasoning over whole papers and long literatures.
+Separate exploratory suggestions from supported conclusions. A reader should be able to trace important numbers and statements to a source or computation.
 
-So use all of them: let Claude Code plan and integrate, push the heavy lifting out to Codex and Antigravity, and cross-check anything that matters. Delegation is done through *subagents* so each job runs in its own context window and returns only a short summary — the main context stays clean for the work you actually supervise.
+## Give each worker one task
 
-## A routing table
+A delegation packet contains the objective, necessary context, allowed files/tools, output format, success criterion, and stop rule. Omit irrelevant files and credentials. A tool-free reviewer needs evidence in the approved prompt; an agentic worker needs an explicitly scoped working directory.
 
-Decide where each piece of work goes. Evaluate top to bottom; **first match wins**. (This is a template — the "specialized tool" rows are wherever you'd point domain-specific skills of your own.)
+A fresh context reduces anchoring. For cross-family review, identify the served model's family rather than its CLI transport. Two sessions of one family are not cross-family evidence. Different families may still make correlated errors.
 
-| # | If the task… | Route it to | Example |
-|---|---|---|---|
-| 1 | needs iterative local feedback loops (edit → run → test → fix) | **Claude Code** | debugging across files, CI fixes, a migration with rollback |
-| 2 | touches secrets, credentials, or destructive/stateful operations | **Claude Code** | API keys, deploys, `rm -rf`, writes to real data |
-| 3 | is a **high-stakes** proof, derivation, or identification argument | **cross-verify** (Codex **and** Antigravity; Claude CLI breaks ties) | a proposition, theorem, or lemma your result depends on |
-| 4 | is routine verification of a known result or a mechanical algebra check | **Antigravity** | "does Theorem 2 in X actually say Y?" |
-| 5 | is code: implement, debug, refactor, test, simulate, wrangle data, mechanical LaTeX | **Codex** | a bootstrap CI routine, a booktabs table, a regex |
-| 6 | is reading/reasoning over long text: literature, citations, summaries | **Antigravity** | a scooping check, a citation audit, a paper summary |
-| 7 | needs a specialized tool you've set up | **that tool** | large multi-source synthesis, a domain checker, cross-session memory |
-| 8 | is drafting prose or teaching material | **Antigravity draft → Claude edit** | an intro paragraph, lecture notes |
+The public default review uses Codex and Gemini. Extra Grok or Claude requests are explicit options. Fixed output slots are documented in [delegate](../skills/delegate/SKILL.md); omitting a leg does not shift them. Resolve disagreements from assumptions, source text, counterexamples, and calculations. Vote counts do not decide a proof.
 
-If nothing matches cleanly, decompose the task and route each piece. For a trivial fix (typo, off-by-one, missing import), skip the table and just do it — delegation overhead isn't worth it.
+## Verify the claim as well as the artifact
 
-## The authoring loop: Explore → Plan → Review → Implement
+| Work | Useful checks | What the check alone cannot establish |
+| --- | --- | --- |
+| Code and data | Known-answer cases, merge coverage, counts, units, seeds, edge cases, reproducibility | That the specification answers the economic question |
+| Empirical analysis | Estimand, identifying variation, uncertainty/clustering, design diagnostics, sensitivity | Causality from a successful program run |
+| Proofs | Original theorem statements, explicit steps, counterexamples, symbolic or numerical checks | A proof from agreement or numerical success |
+| Manuscripts and slides | Source-to-claim audit, code/table/prose consistency, compiled and rendered pages | Contribution from fluent prose or extra output |
+| PDF conversion | Page coverage, numbers/equation tags, findings, residual markers, final status | Perfect transcription from a score or AI audit |
 
-For anything non-trivial, don't dive straight into edits. Run this loop:
+Technical correctness and an important contribution require separate judgments. Verify citations against original text. Search approved local holdings first for sensitive work; obtain permission before disclosing private search terms externally.
 
-1. **Explore.** Have Claude read the relevant files and understand the terrain first.
-2. **Plan.** Switch Claude Code into **plan mode** (`Shift+Tab`) and give it *one* detailed prompt. End planning prompts with **"Ask me any questions"** so it interviews you before committing — precise input means fewer corrections. Avoid long back-and-forth chats; token cost grows fast with conversation length.
-3. **Review.** Have the plan reviewed by a *different* model before you build — e.g. delegate the plan to Codex with `ask_codex.sh` using the `compact_review.txt` template. A second model catches what the author (human or AI) is blind to.
-4. **Implement.** Only now write the code — ideally in a fresh context, so the window is clean for the work itself.
+Define checks before expanding generated output. Automate invariants, trace conclusions end to end, and inspect secondary material. A sample does not certify its uninspected remainder. Investigate failures and expand the audit when needed.
 
-Why bother? Quality goes up (fewer errors reach implementation) *and* tokens go down (the exploration/planning context can be cleared before the build).
+## Keep context and persistent state useful
 
-## Read discipline: "Bash is all you need"
+Use scripts for deterministic extraction, counting, and file operations; inspect compact results. Shell execution still uses compute and tool messages, so describe it as economical rather than free. Read status/provenance first, then the evidence needed for the decision. A success header alone is insufficient for integrating code, a research claim, or a proof.
 
-Tokens are spent reading and writing in the context window — so don't spend them on things a script can do for free.
+Keep standing instructions short and conditional procedures in skills/references. Before clearing or compacting context, record completed checks, active assumptions, unresolved findings, and the next action in the task ledger. Context-size thresholds are workflow choices, not universal model limits.
 
-- **Zero-token execution.** Let the model run a shell command and read three lines of output, not paste a whole file into context.
-- **`head -3`, not `cat`.** Every delegation writes its result to a file with a `STATUS:`/`VERDICT:` header on top. Read the header; open the full file only when the header says something went wrong.
-- **Make a skill for anything you do more than twice.** A skill is a folder with a short instruction file and some shell/Python scripts the model runs — like this one.
+## Protect research and publication
 
-## Cross-verification and the third voter
+Keep restricted data, credentials, confidential reports, and unpublished findings out of external prompts without authorization. Public source material and a private research question have different boundaries. Permission to inspect a document locally does not imply permission to upload it.
 
-For high-stakes claims, one opinion isn't enough:
+Before publication, review an allowlisted export and exact staged diff. Exclude raw inputs, private paths, screenshots, logs, session envelopes, caches, backups, and credentials. Check metadata as well as visible text. Preserve licenses and required installation identifiers. A normal commit can sanitize the current tree while older content remains in history, forks, or caches.
 
-- **`ask_both.sh`** sends the same prompt to Codex and Antigravity in parallel. Compare the two verdicts. **Agreement** is reassuring; **disagreement halts** the pipeline until you resolve it.
-- When the two disagree, add a **third voter**: `INCLUDE_CLAUDE=1 ask_both.sh …` brings in the independent Claude delegate (isolated `~/.claude-delegate` config, zero-tool voter — see the skill's "Independence guarantees" section) for a majority-of-3. (Caveat: the Claude voter shares a model family with the orchestrator, so treat it as mechanical disagreement-detection, not fully independent triangulation.)
-- **You own the final verdict.** The models assist; the human integrates and decides.
-
-## Verification as the load-bearing idea
-
-In software, "looks done" is caught by a test or a build. In research it isn't: a hidden gap in a proof, or a consistent-looking but inconsistent estimator, survives every automatic check and a confident summary. The error is cheap to catch early and expensive once it reaches a referee. So build an explicit **pass/fail gate** for each checkable thing and wire it into your skills and hooks so it runs every time. A few canonical gates:
-
-| Kind of work | A canonical check | Stop rule |
-|---|---|---|
-| Theory, proofs | cross-agent re-derivation; formalization | disagreement halts; the theorem must compile |
-| Reduced-form empirics | placebo test; known-effect recovery | effect must vanish on placebo, reappear on truth |
-| Structural / macro | residuals ≈ 0; moment match | off target ⇒ do not report |
-| Estimation / Monte Carlo | coverage in band; sandwich SE vs. MC SD | undercoverage ⇒ diagnose, never patch |
-
-## Putting it together
-
-A useful mental model has four layers, each a place to intervene:
-
-**Prompt** (write one instruction well) → **Context** (curate what the model sees) → **Harness** (equip what the model can do — tools, subagents, skills like this one) → **Loop** (structure how it iterates — verification, delegation, stopping rules).
-
-`delegate` lives in the *harness* layer: it expands what Claude Code can do by giving it two more models to hand work to, and the read discipline to do so cheaply. The [example `CLAUDE.md`](example-CLAUDE.md) shows how to encode the routing table and these principles as standing instructions.
+The [project instruction template](example-CLAUDE.md) implements these practices without prescribing personal subscriptions, model rankings, or private routing policy.

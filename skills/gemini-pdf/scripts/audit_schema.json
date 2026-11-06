@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "Structured-output contract. The local parser validates structure for every original member in either transport mode, then retains maxLength characters plus an ellipsis for overlong strings and the first 60 findings. Any clamp sets truncated=true and is recorded in parsed clamped and parse_path metadata; page coverage is never clamped.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "pages", "seam_checked", "findings", "truncated", "verdict"],
+  "properties": {
+    "schema": {"const": "gemini-pdf-audit/1"},
+    "pages": {
+      "type": "array", "minItems": 1, "maxItems": 64,
+      "items": {
+        "type": "object", "required": ["page", "readable", "verified"],
+        "properties": {
+          "page": {"type": "integer", "minimum": 1},
+          "readable": {"type": "boolean"},
+          "verified": {"type": "boolean"},
+          "note": {"type": "string", "maxLength": 200}
+        }
+      }
+    },
+    "seam_checked": {"type": "boolean"},
+    "findings": {
+      "type": "array", "maxItems": 60,
+      "items": {
+        "type": "object", "required": ["kind", "severity", "page", "detail"],
+        "properties": {
+          "kind": {"enum": ["MISSING_TEXT", "EXTRA_TEXT", "EQUATION_ERROR", "NUMBER_ERROR", "TABLE_ERROR", "SEAM_GAP", "SEAM_DUP", "STRUCTURE", "UNCERTAIN_LEFT"]},
+          "severity": {"enum": ["critical", "major", "minor"]},
+          "page": {"type": "integer", "minimum": 1},
+          "anchor": {"type": "string", "maxLength": 200},
+          "pdf_text": {"type": "string", "maxLength": 400},
+          "candidate_text": {"type": "string", "maxLength": 400},
+          "detail": {"type": "string", "maxLength": 300}
+        }
+      }
+    },
+    "truncated": {"type": "boolean"},
+    "verdict": {"enum": ["PASS", "FAIL"]}
+  }
+}

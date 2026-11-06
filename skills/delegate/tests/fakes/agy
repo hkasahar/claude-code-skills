@@ -1,0 +1,151 @@
+#!/bin/bash
+set -euo pipefail
+HERE="$(cd "$(dirname "$0")" && pwd)"
+kind=print; model=""; has_model=0; output_json=0; prompt=""; print_timeout=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --help) kind=help; shift ;;
+        --version) kind=version; shift ;;
+        models) kind=models; shift ;;
+        --model) model="$2"; has_model=1; shift 2 ;;
+        -p|--print) prompt="$2"; shift 2 ;;
+        --output-format) [[ "$2" != json ]] || output_json=1; shift 2 ;;
+        --print-timeout) print_timeout="$2"; shift 2 ;;
+        --add-dir|--json-schema) shift 2 ;;
+        --dangerously-skip-permissions) shift ;;
+        --effort) echo "fake: unexpected --effort" >&2; exit 98 ;;
+        *) shift ;;
+    esac
+done
+[[ "$prompt" != /model ]] || kind=model-probe
+[[ "$prompt" != /usage && "$prompt" != /quota ]] || kind=quota-probe
+if [[ -n "${FAKE_AGY_ENV_LOG:-}" ]]; then
+    printf '%s\t%s\tANTIGRAVITY_VOTE=%s\n' "$kind" "$model" "${ANTIGRAVITY_VOTE-unset}" >> "$FAKE_AGY_ENV_LOG"
+fi
+if [[ -n "${FAKE_AGY_LOCK_NOTE_LOG:-}" ]] &&
+    ! grep -qF 'NOTE: a gemini-pdf conversion holds the agy lock' "$FAKE_AGY_LOCK_NOTE_LOG"; then
+    echo 'fake: agy invoked before the lock note' >&2
+    exit 98
+fi
+if [[ -n "${FAKE_AGY_LEDGER:-}" ]]; then
+    # Tabs keep display-string pins intact as one ledger field.
+    epoch="$(python3 -c 'import time; print(time.time_ns() // 1000000)')"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$epoch" "$$" "${kind/version/help}" "$model" "$has_model" "$output_json" >> "$FAKE_AGY_LEDGER"
+fi
+if [[ "$kind" == print && -n "${FAKE_AGY_PRINT_TIMEOUT_LOG:-}" ]]; then
+    printf '%s\t%s\n' "$model" "$print_timeout" >> "$FAKE_AGY_PRINT_TIMEOUT_LOG"
+fi
+case "$kind" in
+    help)
+        cat <<'EOF'
+Usage: agy [flags]
+  --effort string
+  -p, --print string
+  --print-timeout duration
+  --add-dir string
+  --output-format text|json|stream-json
+  --json-schema string
+  --dangerously-skip-permissions
+  --version
+EOF
+        [[ "${FAKE_AGY_HELP:-}" == nomodel ]] || printf '  --model string\n'
+        exit 0 ;;
+    version) echo 1.1.26-fake; exit 0 ;;
+    models)
+        printf 'gemini-4-argon-high\tGemini 4 Argon (High)\ngemini-3.1-pro-high\tGemini 3.1 Pro (High)\ngemini-3.8-flash-high\tGemini 3.8 Flash (High)\nclaude-opus-5-5-high\tClaude Opus 5.5 (High)\n'
+        exit 0 ;;
+esac
+quota_marker=""
+[[ "$kind" != quota-probe ]] || quota_marker="${FAKE_AGY_QUOTA_MARKER:-}"
+python3 - "$HERE/samples" "$kind" "$model" "$output_json" "$prompt" "$PPID" "$$" "$quota_marker" <<'PY'
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+samples, kind, pin, output_json, prompt, supervisor_pid, fake_pid, quota_marker = sys.argv[1:]
+models = {"gemini-4-argon-high": "Gemini 4 Argon (High)",
+          "gemini-4-argon-medium": "Gemini 4 Argon (Medium)",
+          "gemini-4-argon-low": "Gemini 4 Argon (Low)",
+          "gemini-3.1-pro-high": "Gemini 3.1 Pro (High)",
+          "gemini-3.1-pro-low": "Gemini 3.1 Pro (Low)",
+          "gemini-3.8-flash-high": "Gemini 3.8 Flash (High)",
+          "claude-opus-5-5-high": "Claude Opus 5.5 (High)"}
+ids = {label: model for model, label in models.items()}
+model = ids.get(pin, pin) if pin else "gemini-3.8-flash-high"
+
+def sample(name):
+    return json.loads((Path(samples) / name).read_text())
+
+def publish_process(path):
+    if path:
+        # Publish only after the worker exists, so cancellation checks cannot race startup.
+        ready = Path(path)
+        pending = ready.with_suffix(".tmp")
+        pending.write_text(json.dumps({"supervisor_pid": int(supervisor_pid),
+                                      "fake_pid": int(fake_pid), "pid": os.getpid(),
+                                      "pgid": os.getpgrp(), "prompt": prompt,
+                                      "quota_marker": quota_marker}))
+        pending.replace(ready)
+
+if kind == "quota-probe":
+    publish_process(os.getenv("FAKE_AGY_QUOTA_PROCESS_LOG"))
+    time.sleep(float(os.getenv("FAKE_AGY_QUOTA_DELAY", "0")))
+    mode = os.getenv("FAKE_AGY_QUOTA_PROBE")
+    if mode == "fail":
+        print("synthetic quota probe failure", file=sys.stderr)
+        sys.exit(1)
+    if mode == "unparseable":
+        print("not json")
+        sys.exit(0)
+    envelope = sample("agy_usage.sample.json")
+    for group in envelope["command"]["data"]["groups"]:
+        if os.getenv("FAKE_AGY_QUOTA_OMIT_GROUP_NAMES") == "1":
+            group.pop("name", None)
+        for bucket in group["buckets"]:
+            knob = "FAKE_AGY_QUOTA_" + bucket["id"].upper().replace("-", "_")
+            bucket["remaining_fraction"] = float(os.getenv(knob, "1"))
+    print(json.dumps(envelope))
+    sys.exit(0)
+
+if model not in models:
+    envelope = sample("agy_bogus_model_error.sample.json")
+    envelope["error"] = envelope["error"].replace("gemini-does-not-exist", pin)
+    if output_json == "1":
+        print(json.dumps(envelope))
+    else:
+        # Extra test mode verifies classifiers that must inspect both streams.
+        print(envelope["error"], file=sys.stdout if os.getenv("FAKE_AGY_ERROR_STDOUT") == "1" else sys.stderr)
+    sys.exit(1)
+
+if kind == "model-probe":
+    time.sleep(float(os.getenv("FAKE_AGY_PROBE_DELAY", "0")))
+    if os.getenv("FAKE_AGY_PROBE_FAILURE") == "1":
+        print("synthetic probe failure", file=sys.stderr)
+        sys.exit(1)
+    if os.getenv("FAKE_AGY_PROBE_UNPARSEABLE") == "1":
+        print("synthetic invalid JSON")
+        sys.exit(0)
+    report = os.getenv("FAKE_AGY_MODEL_REPORT", model)
+    report_id = ids.get(report, report)
+    label = models.get(report_id, report)
+    name = ("agy_model_probe_opus.sample.json" if model == "claude-opus-5-5-high" else
+            "agy_model_probe_pro.sample.json" if model.startswith(("gemini-4-argon-", "gemini-3.1-pro-")) else
+            "agy_model_probe_flash.sample.json")
+    envelope = sample(name)
+    envelope["command"]["data"]["id"] = report_id
+    envelope["command"]["data"]["label"] = label
+    envelope["response"] = f"{report_id}\t{label}\n"
+    print(json.dumps(envelope) if output_json == "1" else envelope["response"], end="\n" if output_json == "1" else "")
+else:
+    publish_process(os.getenv("FAKE_AGY_PROCESS_LOG"))
+    time.sleep(float(os.getenv("FAKE_AGY_PRINT_DELAY", "0")))
+    if os.getenv("FAKE_AGY_QUOTA_EXHAUSTED") == model:
+        print(f"Error: 429 Too Many Requests: quota exhausted for {model}", file=sys.stderr)
+        sys.exit(1)
+    response = os.getenv("FAKE_AGY_PRINT_REPLY", f"FAKE-REPLY: {prompt[:40]}\n")
+    envelope = sample("agy_json_envelope.sample.json")
+    envelope["response"] = response
+    print(json.dumps(envelope) if output_json == "1" else response, end="\n" if output_json == "1" else "")
+PY

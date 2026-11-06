@@ -1,0 +1,1 @@
+{"command": {"data": {"effort": "high", "id": "gemini-3.8-flash-high", "is_default": false, "label": "Gemini 3.8 Flash (High)"}, "name": "model"}, "conversation_id": "synthetic", "duration_seconds": 0, "num_turns": 0, "response": "gemini-3.8-flash-high\\tGemini 3.8 Flash (High)\\n", "status": "SUCCESS", "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}}

@@ -1,0 +1,1 @@
+{"command": {"data": {"effort": "high", "id": "gemini-4-argon-high", "is_default": false, "label": "Gemini 4 Argon (High)"}, "name": "model"}, "conversation_id": "synthetic", "duration_seconds": 0, "num_turns": 0, "response": "gemini-4-argon-high\\tGemini 4 Argon (High)\\n", "status": "SUCCESS", "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}}

@@ -1,91 +1,6 @@
 #!/bin/bash
-# ask_claude.sh — Dispatch to an INDEPENDENT Claude Code CLI from inside Claude Code.
-# OAuth (subscription) auth by default via a dedicated config dir + token file.
-#
-# ── WHY NO --bare ─────────────────────────────────────────────────────────────
-# Verified 2026-07-07 on Claude Code 2.1.198: under `--bare`, Anthropic auth is
-# "strictly ANTHROPIC_API_KEY or apiKeyHelper via --settings (OAuth and keychain
-# are never read)". Empirically, --bare + CLAUDE_CODE_OAUTH_TOKEN returns
-# "Not logged in" without an API call ever being made; WITHOUT --bare the env
-# token IS sent (fake token -> 401 Invalid bearer token) and takes precedence
-# over keychain credentials. So this wrapper does NOT use --bare; it replicates
-# the hygiene explicitly:
-#   * fresh CLAUDE_CONFIG_DIR (no hooks, plugins, auto-memory, user CLAUDE.md)
-#   * throwaway mktemp cwd in voter mode (no project CLAUDE.md / settings)
-#   * --tools "" in voter mode — zero tool schemas, pure judgment
-#   * --no-session-persistence in voter mode
-# Do NOT "fix" this back to --bare without re-verifying the CLI's auth semantics.
-#
-# ── Independence axes ─────────────────────────────────────────────────────────
-#   1. Config:  dedicated CLAUDE_CONFIG_DIR (default ~/.claude-delegate) — own
-#               auth, settings, session store. Optionally a second subscription.
-#   2. Process: ALL CLAUDECODE*/CLAUDE_CODE_* harness vars are unset in the child
-#               (the orchestrator ambiently exports CLAUDE_CODE_SESSION_ID,
-#               CLAUDE_CODE_EFFORT_LEVEL, CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING,
-#               ... — measured 2026-07-07). CLAUDE_DELEGATE_DEPTH blocks
-#               delegate-of-delegate recursion.
-#   3. Auth:    explicit env token. Priority: token file > inherited
-#               CLAUDE_CODE_OAUTH_TOKEN (WARN) > ANTHROPIC_API_KEY (OPT-IN ONLY
-#               via CLAUDE_DELEGATE_ALLOW_API_KEY=1 — the orchestrator exports a
-#               metered API key ambiently, so an unguarded fallback would
-#               silently bill the API). ANTHROPIC_API_KEY is unset whenever an
-#               OAuth token is selected.
-#   4. Cwd:     voter runs in a throwaway mktemp dir; agentic runs in an
-#               explicit, MANDATORY CLAUDE_DELEGATE_WORKDIR. NOTE: workdir
-#               scoping applies to file tools only — an allowed Bash tool is NOT
-#               jailed to the workdir.
-#
-# Modes:
-#   VOTER (default)                      Pure judgment, zero tools. For
-#                                        majority-of-3 votes, proof verification.
-#   AGENTIC (CLAUDE_DELEGATE_AGENTIC=1)  Full agent loop with pre-approved tools
-#                                        in CLAUDE_DELEGATE_WORKDIR. Symmetric
-#                                        with the Codex leg. Prompts are
-#                                        trusted-code territory.
-#
-# Usage:
-#   bash ask_claude.sh "your prompt here" [output_file]
-#   bash ask_claude.sh @prompt_file.md [output_file]
-#   CLAUDE_DELEGATE_AGENTIC=1 CLAUDE_DELEGATE_WORKDIR=~/proj/wt \
-#     bash ask_claude.sh @task.md out.md
-#   CLAUDE_DELEGATE_AGENTIC=1 CLAUDE_DELEGATE_WORKDIR=~/proj/wt \
-#     CLAUDE_DELEGATE_RESUME=<session_id> bash ask_claude.sh "follow-up" out2.md
-#
-# One-time setup (run in a regular terminal, NOT via `!` inside Claude Code —
-# the token must never enter argv, shell history, or a session transcript):
-#   CLAUDE_CONFIG_DIR=~/.claude-delegate claude setup-token
-#   umask 077
-#   cat > ~/.claude-delegate/oauth_token    # paste token, Enter, Ctrl-D
-#
-# Environment variables — wrapper knobs live in the CLAUDE_DELEGATE_* namespace.
-# Legacy CLAUDE_MODEL/CLAUDE_EFFORT/CLAUDE_TIMEOUT/CLAUDE_AGENTIC/... are IGNORED:
-# the harness ambiently exports CLAUDE_EFFORT (and more) into every Bash child,
-# so un-namespaced knobs would silently take the orchestrator's values.
-#   CLAUDE_DELEGATE_CONFIG_DIR     default ~/.claude-delegate
-#   CLAUDE_DELEGATE_MODEL          default opus
-#   CLAUDE_DELEGATE_EFFORT         default max (applied only if CLI has --effort)
-#   CLAUDE_DELEGATE_TIMEOUT        default 570 seconds — deliberately under the
-#                                  Bash tool's 600 s default cap so the wrapper's
-#                                  own timeout classification fires BEFORE a
-#                                  harness kill (which would leave no envelope).
-#                                  Raise it only together with BASH_MAX_TIMEOUT_MS
-#                                  or run_in_background on the calling side.
-#   CLAUDE_DELEGATE_AGENTIC        default 0
-#   CLAUDE_DELEGATE_WORKDIR        REQUIRED in agentic mode (no $PWD fallback)
-#   CLAUDE_DELEGATE_ALLOWED_TOOLS  default Read,Grep,Glob,Edit,Write,Bash (agentic)
-#   CLAUDE_DELEGATE_MAX_TURNS      default 1 voter / 40 agentic — applied via a
-#                                  runtime parser probe (the flag exists on
-#                                  2.1.198 but is hidden from --help); WARNs if
-#                                  a future CLI drops it. CLAUDE_DELEGATE_TIMEOUT
-#                                  remains the hard guardrail.
-#   CLAUDE_DELEGATE_RESUME         session ID; agentic-only (hard error in voter)
-#   CLAUDE_DELEGATE_ADD_DIRS       colon-separated --add-dir paths (agentic)
-#   CLAUDE_DELEGATE_ALLOW_API_KEY  default 0 — set 1 to permit metered API fallback
-#
-# Read discipline: head -3 output.md; cat only on FAILED/ERROR/GAP.
-# Raw JSON envelope preserved at ${output%.md}.json — never cat it on success.
-# Provenance header records mode/model/effort/auth/session/cost_usd/turns.
-
+# ask_claude.sh — Explicit optional Claude dispatch with separate config, credential isolation and tool-free voter mode.
+# See ../references/legs.md for modes, dependencies, costs and limitations.
 set -euo pipefail
 
 # Portable timeout: GNU timeout -> gtimeout (Homebrew) -> perl fallback
@@ -157,7 +72,7 @@ QUERY="${1:-}"
 OUTPUT="${2:-${TMPDIR:-/tmp}/claude/claude_result_$(date +%s)_$$.md}"
 TIMEOUT="${CLAUDE_DELEGATE_TIMEOUT:-570}"
 MODEL="${CLAUDE_DELEGATE_MODEL:-opus}"
-EFFORT="${CLAUDE_DELEGATE_EFFORT:-max}"
+EFFORT="${CLAUDE_DELEGATE_EFFORT:-xhigh}"
 CONFIG_DIR="${CLAUDE_DELEGATE_CONFIG_DIR:-$HOME/.claude-delegate}"
 AGENTIC="${CLAUDE_DELEGATE_AGENTIC:-0}"
 

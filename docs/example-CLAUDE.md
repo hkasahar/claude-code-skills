@@ -1,75 +1,49 @@
-# Example `CLAUDE.md` (a template you adapt)
+# Example project instructions
 
-`CLAUDE.md` is a file Claude Code reads at the start of every session and after every `/clear`. It's where you put standing instructions — how you want Claude to plan, delegate, and verify. A global one lives at `~/.claude/CLAUDE.md`; a per-project one lives at the repo root and adds to it.
-
-Below is a **generic, ready-to-adapt** template that encodes the orchestrate-and-verify workflow this repo supports. It contains **no personal paths, tools, or data** — fill in the `<…>` placeholders with your own. Copy the parts you want; delete the rest. Keep it short: `CLAUDE.md` is read into context every session, so every line costs tokens on every task.
-
----
+Adapt this into the instruction file your agent reads, such as `CLAUDE.md` or `AGENTS.md`. Retain rules relevant to the project. Do not store credentials or personal records in instructions.
 
 ```markdown
-# CLAUDE.md
+# Project instructions
 
-## Session start
-1. Read `CHECKPOINT.md` and `MEMORY.md` if they exist — resume from the last known state.
-2. Read `tasks/lessons.md` if it exists — don't repeat past mistakes.
-3. Identify the active project from the working directory and git branch.
+## Start and resume
+- Identify the project and Git branch.
+- Read project instructions and tasks/lessons.md when present.
+- Use task ledgers as persistent state; checkpoints are supplementary.
 
-## Core principles
-- **Maximum effort.** Think exhaustively; don't cut corners or leave TODOs. Produce complete work on the first pass, then re-read it against the request before replying.
-- **Plan before acting.** For any non-trivial task (3+ steps or a design decision), use plan mode. Interview me with concrete options; end planning prompts by asking me any open questions. One detailed prompt beats a long chat.
-- **Verify before "done".** Prove it works — tests, logs, a diff of behavior. Ask: "would a senior reviewer approve this?" Don't claim something passes without showing the check.
-- **Ask, don't guess.** Under ambiguity, ask 2–5 targeted questions with options before proceeding.
+## Scope and planning
+- Inspect discoverable facts before asking questions.
+- Save a checkable plan before substantial edits.
+- Clarify choices that change assumptions, methods, claims, or scope.
+- Complete required independent plan review before implementation.
+- Continue routine, reversible work within the authorized scope.
 
-## Orchestration (delegate aggressively, verify rigorously)
-Operate as a manager. Hand heavy work to Codex (code, math, simulation) and Antigravity
-(reading, literature, long-context) via the `delegate` skill; keep orchestration,
-integration, and the final quality gate here. Package full context into every delegation
-prompt — the external CLIs cannot see project files.
+## Delegation
+- The root owns integration and the final quality gate.
+- Give workers one bounded task, permitted files, and a return contract.
+- Use disjoint files or isolated worktrees for parallel writers.
+- Give reviewers original evidence without a preferred verdict.
+- Distinguish fresh context from model-family independence.
+- Require authorization before external disclosure or paid dispatch.
+- Keep credentials and destructive operations with the root.
 
-Routing (first match wins):
-| # | Condition | Route |
-|---|-----------|-------|
-| 1 | Iterative local loops (edit→run→test→fix) | Claude Code |
-| 2 | Secrets, credentials, destructive ops | Claude Code |
-| 3 | High-stakes proof / identification argument | Cross-verify (Codex + Antigravity; Claude CLI breaks ties) |
-| 4 | Routine check of a known result / algebra | Antigravity |
-| 5 | Code: implement, debug, refactor, test, simulate, mechanical LaTeX | Codex |
-| 6 | Reading/reasoning: literature, citations, summaries | Antigravity |
-| 7 | <your specialized skills> | <that tool> |
-| 8 | Drafting prose / teaching material | Antigravity draft → Claude edit |
+## Evidence and checks
+- Claim a test passed only when it ran successfully in this work.
+- Check important claims against original sources or reproducible computation.
+- Verify code, tables, figures, and prose agree.
+- State estimands and identification assumptions for empirical claims.
+- Numerical checks provide evidence; they are not proofs.
+- Resolve disagreements from evidence rather than vote totals.
+- Bound retries and record failed checks and unresolved issues honestly.
 
-For trivial fixes (typo, off-by-one, missing import), skip the table and do it directly.
+## Persistent state
+- Record assumptions, progress, checks, and next actions in task ledgers.
+- After substantive corrections, add concise prevention rules.
+- Write a concrete handoff before clearing context.
 
-## Delegation discipline
-- One task per subagent; keep the main context clean.
-- Read delegation output with `head -3` (the STATUS/VERDICT header); `cat` only on failure.
-- Cap total concurrent external dispatches at <N> across all subagents (I use 6).
-- When Codex and Antigravity disagree on a high-stakes claim, resolve it before accepting — do not average two answers.
-
-## Quality gates (check before presenting)
-| Task type | Must verify |
-|-----------|-------------|
-| Code | Runs; tests pass; seeds set; no absolute paths |
-| Proofs | Every step explicit; assumptions stated; cited results checked against the source |
-| Empirical | Identification clear; SEs appropriate; diagnostics included |
-| Delegated | STATUS/VERDICT checked; output matches spec; disagreements resolved |
-If a gate fails, retry — don't present broken work.
-
-## Context and memory
-- `/clear` once the context window is well used (performance degrades and tokens rise as it fills).
-- Before clearing, make sure the next steps are written down (`tasks/todo.md`, `MEMORY.md`).
-
-## About me / conventions
-- <your field, languages, and style preferences — e.g. "Default to R; LaTeX for writing.">
+## Publication
+- Keep raw inputs, credentials, settings, private paths, logs, and caches local.
+- Review an allowlisted export and staged blobs before publication.
+- Deleting a current file does not delete public history.
 ```
 
----
-
-## How to use this
-
-1. Save your version as `~/.claude/CLAUDE.md` (global) or `<repo>/CLAUDE.md` (project).
-2. Fill in every `<…>` placeholder; delete rows and sections you don't need.
-3. Install the [`delegate`](../README.md) skill so the "Codex / Antigravity" routes actually work.
-4. Iterate: when Claude makes a mistake, add a one-line rule to `tasks/lessons.md` (or here) so it doesn't recur.
-
-See [WORKFLOW.md](WORKFLOW.md) for the reasoning behind each section.
+Add domain-specific language, notation, style, and test commands in your own project. Keep provider/model choices configurable rather than embedding an account-specific quota policy in every task.

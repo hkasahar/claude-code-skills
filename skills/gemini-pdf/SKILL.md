@@ -1,183 +1,95 @@
 ---
 name: gemini-pdf
-description: Convert PDF files to clean Markdown using Antigravity CLI (`agy`). Best for academic papers with math, tables, and structured content. The native pipeline feeds page-range chunk PDFs directly to Gemini's vision pathway (agy reads the PDF itself — no lossy text extraction), with an automatic quality-gated fallback to a Mathpix hybrid and Mathpix standalone. Zero marginal cost via a Google subscription. Triggers include "convert PDF to markdown with Antigravity", "agy PDF conversion", "PDF to markdown with math", and "convert paper to markdown".
+description: Convert PDFs to Markdown through Antigravity CLI with chunk fidelity checks, model audits, repair, deadlines, and capped optional Mathpix OCR.
 ---
 
-# PDF-to-Markdown Conversion (via Antigravity CLI)
+# PDF to Markdown
 
-> **Note**: The skill folder is named `gemini-pdf` for backward compatibility with the `/gemini-pdf` slash command. Internally it drives Antigravity CLI (`agy`), Google's successor to the original Gemini CLI.
+Use this skill to transcribe PDFs with math, tables, footnotes, or multiple columns. The bundled converter uses `agy` for external model calls. It can use Mathpix when credentials are configured. A successful check is evidence about the transcription, not a guarantee of accuracy.
 
-## When to Use
+PDF pages and candidate text leave the machine during model/OCR dispatch. The converter prints a `CONFIDENTIALITY:` notice before its first dispatch to each provider. These notices are **warning only**: they do not request approval, block uploads, or enforce privacy. Obtain any required disclosure authorization before running it. Sidecars and retained audit details can contain document text and paths; store them accordingly.
 
-- Academic papers with mathematical notation (LaTeX reconstructed from the rendered page)
-- Papers with complex tables, theorems, proofs, or two-column layouts
-- Scanned PDFs (the native vision pathway OCRs them; the Mathpix fallback also handles them)
-- Zero-cost conversion via a Google One AI subscription (no API keys for the primary path)
+## Dependencies
 
-## When NOT to Use
+Use Python 3.10+, Bash, Perl, `jq`, and Poppler (`pdfinfo`, `pdftotext`, `pdfseparate`, `pdfunite`). Install the Python dependencies in [requirements.txt](requirements.txt) into a suitable environment. `pypdf` is the preferred splitter; Poppler supplies a fallback. `requests` is needed by the Mathpix helper. The optional `markitdown` executable supports the text extraction lane and is not bundled. Configure `agy` and its authentication separately. This package does not install or authenticate providers.
 
-- **Need exact LaTeX source** → ask the author or use Mathpix directly
-- **Enormous documents (>500 pages)** → split into chapters first (hard page ceiling)
+Model identifiers are configurable examples carried by the code, not claims about current availability, pricing, or accuracy. Set `GEMINI_PDF_MODEL` and `GEMINI_PDF_AUDIT_MODEL` to identifiers supported by your CLI. Defaults are `gemini-4-argon-high` and `gemini-3.8-flash-high`. The identity probe sends `/model`, without document content; provider availability still requires a live check. No zero-cost conversion is promised.
 
-## Locating the script
+## Run
 
-Examples below call the script through `$GEMINI_PDF`. Set it once per shell so they work whether the skill was installed as a plugin or copied manually:
+Resolve `SKILL_DIR` to this installed skill directory, then:
 
 ```bash
-if [ -n "$CLAUDE_PLUGIN_ROOT" ]; then
-  GEMINI_PDF="$CLAUDE_PLUGIN_ROOT/skills/gemini-pdf"   # installed as a Claude Code plugin
-else
-  GEMINI_PDF="$HOME/.claude/skills/gemini-pdf"          # installed by manual copy
-fi
+bash "$SKILL_DIR/scripts/pdf_to_markdown.sh" paper.pdf output.md
+bash "$SKILL_DIR/scripts/pdf_to_markdown.sh" paper.pdf output.md --strict
+bash "$SKILL_DIR/scripts/pdf_to_markdown.sh" paper.pdf --no-audit --no-fallback
+bash "$SKILL_DIR/scripts/pdf_to_markdown.sh" paper.pdf --pipeline text
 ```
 
-(The script self-resolves its own helper scripts, so it runs correctly from any location.)
+The default native lane splits PDFs into chunks of at most 10 pages, runs calls sequentially under a global lock, and uses a process-group watchdog. Failed/truncated conversions retry and can bisect down to individual pages. The default maximum input is 500 pages.
 
-## Quick Usage
+Each native chunk receives a deterministic fidelity gate and a model audit against its PDF pages. A failed chunk may receive a repair or fresh conversion; repeated truncation can bisect it. Remaining failures may use chunk-scoped Mathpix under the cap. The best available attempt retains explicit uncertainty/failure markers. Empty or denied audits never count as a pass. Text, hybrid, Mathpix, and `--no-audit` lanes use the legacy quality/fallback route; they do not provide native chunk audits.
+
+The deterministic gate checks content/numeral recall, per-page coverage, missing sentences, injected DOIs, math/OCR, and uncertainty markers. Floors can be configured with `GEMINI_PDF_CHUNK_FLOORS`. With an absent or unusable PDF text layer, source-relative checks are unavailable and the report sets `det_weak=true`; model review then carries more of the fidelity assessment. Model audits can miss defects or raise false findings. Review important equations and claims against the original PDF.
+
+## Outputs and exit status
+
+Stdout contains only the resulting Markdown path. Logs and the final `AUDIT:` summary go to stderr. Sidecars include `.err`, `.meta.json`, `.quality.json`, and, for audited native runs, `.audit.json`. Audit details are retained for nonverified runs or when `GEMINI_PDF_KEEP_AUDIT_DIR=1`.
+
+| Document status | Meaning | Default exit | `--strict` exit |
+| --- | --- | --- | --- |
+| `verified` | All chunks passed the configured gate and audit | 0 | 0 |
+| `degraded` | An audit or another step was unavailable/skipped | 0 | 3 |
+| `partial` | At least one retained chunk is unverified | 0 | 4 |
+| `failed` | A chunk failed or the run aborted | 2 | 2 |
+| `disabled` | Audit route disabled | 0 on successful conversion | 0 on successful conversion |
+
+Usage/environment errors return 1. A failed audited run publishes `output.failed.md`, leaves no successful `output.md`, and reports its actual state. An existing destination is preserved as `output.md.pre-<run_nonce>`. A degraded or partial exit 0 does not mean every chunk verified: inspect the report or use strict mode. Audit reports use temporary-file replacement; failure recovery retains the best available artifact and records missing evidence.
+
+## Deadline and paid OCR controls
+
+The audit-mode default deadline is 3300 seconds, including lock waits. Each external call is clamped to the remaining budget, with 120 seconds reserved for publication. Optional steps skip when their minimum budgets are unavailable; mandatory conversion without sufficient budget fails its chunk. Skips appear in the Markdown, report, and summary. `--no-audit` enforces a deadline only when explicitly configured.
+
+Mathpix can incur charges whenever credentials are set and a permitted lane reaches it, including automatic fallback. `--force-mathpix` and `--hybrid` also obey the cap. To disable Mathpix dispatch:
 
 ```bash
-# Basic: native pipeline, outputs paper.md alongside paper.pdf
-bash "$GEMINI_PDF/scripts/pdf_to_markdown.sh" paper.pdf
-
-# Specify output path
-bash "$GEMINI_PDF/scripts/pdf_to_markdown.sh" paper.pdf /tmp/output.md
-
-# Choose a pipeline explicitly
-bash "$GEMINI_PDF/scripts/pdf_to_markdown.sh" paper.pdf --pipeline text
-bash "$GEMINI_PDF/scripts/pdf_to_markdown.sh" paper.pdf --hybrid
-bash "$GEMINI_PDF/scripts/pdf_to_markdown.sh" paper.pdf --force-mathpix
-
-# Disable auto-chunking (single agy pass over the whole PDF)
-bash "$GEMINI_PDF/scripts/pdf_to_markdown.sh" paper.pdf --no-chunk
-
-# Disable the quality-gated fallback chain
-bash "$GEMINI_PDF/scripts/pdf_to_markdown.sh" paper.pdf --no-fallback
-
-# Custom quality threshold (default: 60)
-bash "$GEMINI_PDF/scripts/pdf_to_markdown.sh" paper.pdf --quality-threshold 40
+bash "$SKILL_DIR/scripts/pdf_to_markdown.sh" paper.pdf --mathpix-page-cap 0
 ```
 
-## Architecture
+The default cap is 20 pages per document across a 24-hour ledger window. Reservations occur before dispatch, and failed/ambiguous uploads consume their reservation. Unreadable spend ledgers block automatic Mathpix use. Each guarded upload uses `--max-attempts 1`; calling `mathpix_extract.py` directly bypasses the converter's cap and ledger. The standalone helper defaults to three upload attempts. Use the converter when you need those spend controls.
 
-### Native pipeline (default)
+| Setting / flag | Default / purpose |
+| --- | --- |
+| `GEMINI_PDF_MATHPIX_PAGE_CAP`, `--mathpix-page-cap N` | 20; 0 disables dispatch |
+| `GEMINI_PDF_MATHPIX_LEDGER` | `$HOME/.claude/delegate-logs/mathpix_ledger.tsv` |
+| `GEMINI_PDF_MATHPIX_CAP_WINDOW_H` | 24 hours |
+| `GEMINI_PDF_MATHPIX_USD_PER_PAGE` | 0.025, a placeholder estimate; verify your rate |
+| `MATHPIX_APP_ID`, `MATHPIX_APP_KEY` | Required for Mathpix; never bundled |
+| `GEMINI_PDF_DEADLINE`, `--deadline S` | 3300 seconds in audit mode |
+| `GEMINI_PDF_REPAIR_ROUNDS`, `--repair-rounds N` | 1 |
+| `GEMINI_PDF_AUDIT_MAJOR_MAX` | 4; critical findings always fail |
+| `GEMINI_PDF_STRICT=1`, `--strict` | Distinguishes degraded/partial exits |
 
-`agy` reads the PDF **directly** through Gemini's vision/document pathway — math layout, column order, and table geometry are seen as rendered, not guessed back from lossy text extraction:
+The Mathpix client rejects redirects, verifies TLS, and disables environment proxy/netrc inheritance. Its `MATHPIX_API_BASE` override exists for explicit alternative origins and localhost contract tests; it must be trusted because credentials are sent there.
 
-```
-pdfinfo → page count P
-P ≤ 10 → single chunk (whole PDF)
-P > 10 → split_pdf_pages.py → chunk PDFs of ≤ 10 pages (1-indexed inclusive ranges)
-for each chunk SEQUENTIALLY (global agy lock):
-    isolated temp dir containing only that chunk PDF
-    agy --model "$MODEL" --add-dir <dir> --print-timeout <T>s -p "<prompt>"
-    validate (nonce end-sentinel + ratio guards) → retry → bisect on repeated failure
-concatenate → quality gates → sanitize → output.md
-```
+## Optional reference sync
 
-- The first chunk's prompt produces YAML front matter (`title/authors/year/journal/doi`) **plus** the `# Title` heading; continuation chunks follow a seam protocol (transcribe from the first character of the page, resume exactly after the previous chunk's tail — provided as read-only context — never skip, never repeat).
-- Failed/truncated chunks are retried once, then recursively bisected down to single pages before a `<!-- CHUNK N FAILED -->` placeholder is accepted.
-- Prompts instruct the model to flag unreadable passages as `<!-- UNCERTAIN: ... -->` rather than guess — a flagged gap always beats fluent fabrication.
+No reference library is inferred or written by default. Opt in with an explicit existing destination:
 
-### Concurrency constraint (hard, probe-verified)
-
-Two concurrent `agy --print` processes **hang** (0 bytes output, both ignore their own `--print-timeout`; verified live 2026-07-07 on agy 1.0.16, plain and with `--new-project`). Consequently:
-
-- All agy calls run strictly sequentially under a global lock (`$TMPDIR/gemini-pdf-agy.lock`); concurrent script invocations serialize automatically.
-- Every agy call is wrapped in an external watchdog (`TIMEOUT+60s`) that kills the **whole process group** and sweeps orphans — agy's own timeout cannot be trusted under contention.
-- `agy --sandbox` also hangs the native read (probe-verified) and is not used.
-
-### Fallback chain (auto, quality-gated)
-
-```
-native ──eligible & ≥threshold──→ done
-   │ low
-   ▼
-hybrid: mathpix --mode extract → agy structural cleanup (math preserved verbatim)
-   │ low
-   ▼
-mathpix standalone → best eligible attempt wins
+```bash
+GEMINI_PDF_REFERENCE_DIR=/path/to/reference \
+  bash "$SKILL_DIR/scripts/pdf_to_markdown.sh" paper.pdf output.md --bib-key sample2026
 ```
 
-Winner selection is two-stage: **eligibility gates** first (no failed chunks, fidelity floors, completeness floor), then comparison on **literalness-neutral** dimensions only (math quality, structure, OCR, failed chunks) — recall-vs-source dimensions would unfairly reward the most literal attempt. A later stage must beat an earlier one by ≥5 points to displace it. Losing attempts are kept as `output.attempt-<stage>.md`.
+`REFERENCE_DIR` is a compatible explicit alternative; `GEMINI_PDF_REFERENCE_DIR` takes precedence when nonempty. With a BibTeX key, the sync helper copies PDF/Markdown and adds metadata to `reference.bib`; without a key, it copies Markdown only when the destination `md/` exists. Existing copies are kept unless `--force-sync` is selected. Degraded and partial results can sync, so use strict mode and inspect statuses before ingestion. Failed audited results do not sync. The standalone helper requires `--central-ref`, `GEMINI_PDF_REFERENCE_DIR`, or `REFERENCE_DIR` and refuses a missing destination.
 
-Degraded environments: agy missing → Mathpix standalone (the text pipeline needs agy too); poppler missing → text pipeline with markitdown; pypdf missing → poppler page splitter.
+## Offline verification
 
-### Model configuration
+```bash
+bash "$SKILL_DIR/tests/run_offline_suite.sh" --unit
+bash "$SKILL_DIR/tests/run_offline_suite.sh"
+```
 
-`agy` ≥ 1.0.5 has a working `--model` flag; the script passes `GEMINI_PDF_MODEL` (default **"Gemini 3.1 Pro (High)"**) on every call and falls back to the `~/.gemini/antigravity-cli/settings.json` model only if the installed agy lacks the flag. List models with `agy models`.
+Unit tests also require the dependencies in `requirements-dev.txt` (`jsonschema` plus the runtime dependencies). Select a configured interpreter with `GEMINI_PDF_TEST_PYTHON`; its environment path is preserved. `OFFLINE_TEST_PYTHONPATH` explicitly selects existing dependency directories for read-only imports when needed; ambient `PYTHONPATH` is never inherited.
 
-### Quality verification
-
-`scripts/quality_check.py` scores 0-100 with per-dimension breakdown:
-
-| Dimension | Weight (with source text) | Checks |
-|-----------|--------------------------|--------|
-| Content completeness | 20% | raw output vs source-text ratio (band 0.5–2.0) |
-| Math quality | 20% | balanced `$`/`$$` (currency-aware), well-formed LaTeX |
-| Structural integrity | 15% | title, sections, bibliography, tables, theorem markers |
-| OCR artifacts | 10% | replacement chars, garbled runs, ligatures |
-| Failed chunks | 10% | any failure hard-caps the overall score at ≤50 |
-| Numeric fidelity | 15% | recall of source numerals (boilerplate/page-number filtered) |
-| Trigram recall | 10% | recall of source prose trigrams (normalized) |
-
-Plus: `comparison_score` (literalness-neutral, for cross-attempt selection), `eligible` + reasons, UNCERTAIN-marker count (small penalty), and front-matter detection. Corrupted PDF text layers (some 1990s journal PDFs encode `.` as `+` or `(` as `Ž`) are detected automatically and the source-dependent dimensions are skipped — recall against a garbled reference would punish a *correct* conversion. Without source text, a legacy five-dimension weighting applies. Non-mathematical documents redistribute the math weight adaptively.
-
-### Sanitization
-
-Converted Markdown originates from an untrusted PDF; `scripts/sanitize_md.py` strips `<script>`/`<iframe>`/`<object>` blocks, HTML event-handler attributes, and `javascript:` URLs before any downstream use, reporting every removal.
-
-### Optional reference-library sync
-
-**Opt-in and off by default.** When `GEMINI_PDF_REFERENCE_DIR` points to an existing directory (layout: `pdf/`, `md/`, `reference.bib`), the final winner (only — never intermediate attempts) is synced there: with `--bib-key KEY`, PDF → `pdf/KEY.pdf`, MD → `md/KEY.md`, and a BibTeX entry is appended (metadata precedence: JSON sidecar → the MD's own YAML front matter → key-only entry). Copies are skip-if-exists; `--force-sync` overwrites the PDF/MD copies (bib entries are never replaced). Without the env var set, nothing is written outside your output path. See [docs/gemini-pdf.md](../../docs/gemini-pdf.md).
-
-## Environment Variables
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `GEMINI_PDF_MODEL` | `Gemini 3.1 Pro (High)` | Passed to `agy --model` on every call |
-| `GEMINI_PDF_TIMEOUT` | `600` | Per-chunk timeout (s); watchdog fires at +60s |
-| `GEMINI_PDF_PIPELINE` | `native` | `native` \| `text` \| `hybrid` \| `mathpix` |
-| `GEMINI_PDF_PAGES_PER_CHUNK` | `10` | Native pipeline pages per chunk |
-| `GEMINI_PDF_MAX_PAGES` | `500` | Hard page ceiling (split larger docs first) |
-| `GEMINI_PDF_CHUNK_THRESHOLD` | `50000` | Text pipeline: chunk above this many bytes |
-| `GEMINI_PDF_CHUNK_MAX` | `100000` | Text pipeline: max bytes per chunk |
-| `GEMINI_PDF_QUALITY_THRESHOLD` | `60` | Quality gate for the fallback chain |
-| `GEMINI_PDF_MATHPIX_FALLBACK` | `true` | Enable/disable automatic Mathpix fallback |
-| `GEMINI_PDF_LOCK_DIR` | `$TMPDIR/gemini-pdf-agy.lock` | Global agy serialization lock |
-| `GEMINI_PDF_REFERENCE_DIR` | (unset — opt-in) | **Optional.** Central reference library root; sync is skipped entirely unless set to an existing directory |
-| `MATHPIX_APP_ID` / `MATHPIX_APP_KEY` | (none) | Mathpix API credentials (hybrid + fallback) |
-
-## Flags
-
-| Flag | Description |
-|------|-------------|
-| `--pipeline native\|text\|hybrid\|mathpix` | Choose the conversion pipeline |
-| `--extractor pdftotext\|markitdown` | Text-pipeline extractor (implies `--pipeline text`) |
-| `--no-chunk` | Single agy pass (native: whole PDF; text: no splitting) |
-| `--no-fallback` | Disable the quality-gated fallback chain |
-| `--force-mathpix` | Mathpix standalone (skip agy entirely) |
-| `--hybrid` | Mathpix extraction + agy structural cleanup |
-| `--bib-key KEY` | Sync winner to the reference library under KEY (needs `GEMINI_PDF_REFERENCE_DIR`) |
-| `--force-sync` | Overwrite existing library PDF/MD copies |
-| `--quality-threshold N` | Override quality gate (default 60) |
-
-## Output files
-
-For `output.md` the script may also write: `output.err` (agy stderr per chunk), `output.meta.json` (per-chunk ledger: page ranges, bytes, retries, status), `output.quality.json` (full quality report), and `output.attempt-<stage>.md` (losing fallback attempts, kept for manual override).
-
-## Troubleshooting
-
-| Problem | Solution |
-|---------|----------|
-| `agy not found` | `curl -fsSL https://antigravity.google/cli/install.sh \| bash` |
-| `Authentication required` from `agy` | Run `agy` interactively once and complete the OAuth flow |
-| Conversion very slow | Chunks run sequentially by design (parallel agy hangs — verified). ~1-4 min/chunk is normal |
-| Another conversion seems stuck | Check the lock: `ls $TMPDIR/gemini-pdf-agy.lock` — stale locks from dead processes are removed automatically |
-| Timeout on a dense chunk | Increase `GEMINI_PDF_TIMEOUT=1200`; the pipeline also auto-bisects failing chunks |
-| `<!-- CHUNK N FAILED -->` in output | That page range failed after retries + bisection; re-run, or convert those pages separately |
-| Math still garbled | Confirm the model: `GEMINI_PDF_MODEL="Gemini 3.1 Pro (High)"`; try `--hybrid` (Mathpix math OCR) |
-| Scanned PDF (no text layer) | Native pipeline handles it (vision); `--force-mathpix` is the alternative |
-| Low quality score | Inspect `output.quality.json`; try `--hybrid` or `--force-mathpix`; lower `--quality-threshold` |
-| Mathpix fallback not triggering | Set `MATHPIX_APP_ID` and `MATHPIX_APP_KEY` |
-| Empty output | Check `output.err` for agy errors |
-| Wrong model used | This agy build may lack `--model` (warning is printed); set it in `~/.gemini/antigravity-cli/settings.json` |
+The launcher copies the package to scratch, clears inherited credentials/configuration, creates temporary home/cache/reference/ledger roots, supplies a restricted local-tool PATH, and uses recording provider stubs. Python sockets are restricted to loopback for the Mathpix HTTP contract tests. The 25-page fixture and CLI envelopes are synthetic. Fixture compilation requires `pdflatex` with common LaTeX packages; it disables shell escape. Tests establish local behavior, not live provider authentication, availability, or transcription accuracy. Nothing in the package invokes MinerU or downloads model weights.

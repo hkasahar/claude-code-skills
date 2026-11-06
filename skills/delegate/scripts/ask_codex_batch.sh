@@ -1,32 +1,36 @@
 #!/bin/bash
-# ask_codex_batch.sh — Dispatch multiple Codex tasks in parallel from a manifest
-#
-# Usage:
-#   bash ask_codex_batch.sh manifest.tsv
-#
-# Manifest format (TSV, one task per line):
-#   output_path<TAB>@prompt_file
-#
-# Inline prompts are NOT supported — all prompts must be written to files
-# first and referenced with @. This avoids shell quoting issues.
-#
-# Environment variables:
-#   BATCH_TIMEOUT    Overall timeout in seconds (default: 580)
-#   CODEX_TIMEOUT    Per-task timeout (default: BATCH_TIMEOUT - 20)
-#   CODEX_MODEL      Model to use (passed through to ask_codex.sh)
-#
-# Output:
-#   stdout: "BATCH: N/M succeeded | task1:DONE task2:MODEL_FAILED ..."
-#   Exit code: 0 if all succeeded, 1 if any failed
-
+# ask_codex_batch.sh — Dispatch @file tasks from an output-path/tab/prompt manifest with bounded concurrency.
+# See ../references/legs.md for modes, dependencies, costs and limitations.
 set -uo pipefail
 # Note: no set -e — we need to handle individual task failures
 
+CREDIT_ARGS=()
+CREDIT_FALLBACK=off
+if [[ "${1:-}" == --credit-fallback* ]]; then
+    if [[ "$1" != --credit-fallback ]]; then
+        echo "Usage: ask_codex_batch.sh [--credit-fallback off|deepseek|deepseek-api] manifest.tsv" >&2
+        exit 2
+    fi
+    case "${2:-}" in
+        off|deepseek|deepseek-api) CREDIT_FALLBACK="$2"; CREDIT_ARGS=(--credit-fallback "$2"); shift 2 ;;
+        *) echo "Usage: ask_codex_batch.sh [--credit-fallback off|deepseek|deepseek-api] manifest.tsv" >&2; exit 2 ;;
+    esac
+fi
+if [[ "$CREDIT_FALLBACK" != off && ( "${CODEX_EFFORT:-}" == max || "${CODEX_EFFORT:-}" == ultra ) ]]; then
+    echo "Usage error: --credit-fallback is forbidden for max and ultra dispatches" >&2
+    exit 2
+fi
 MANIFEST="${1:-}"
-BATCH_TIMEOUT="${BATCH_TIMEOUT:-580}"
+BATCH_TIMEOUT="${BATCH_TIMEOUT:-3600}"
+BATCH_CONCURRENCY="${BATCH_CONCURRENCY:-4}"
+
+if ! [[ "$BATCH_CONCURRENCY" =~ ^[0-9]+$ ]] || (( BATCH_CONCURRENCY < 1 )); then
+    echo "ERROR: BATCH_CONCURRENCY must be a positive integer (got: ${BATCH_CONCURRENCY})" >&2
+    exit 1
+fi
 
 if [[ -z "$MANIFEST" || ! -f "$MANIFEST" ]]; then
-    echo "Usage: ask_codex_batch.sh manifest.tsv" >&2
+    echo "Usage: ask_codex_batch.sh [--credit-fallback off|deepseek|deepseek-api] manifest.tsv" >&2
     echo "Manifest format: output_path<TAB>@prompt_file (one per line)" >&2
     exit 1
 fi
@@ -106,15 +110,31 @@ if [[ $N_TASKS -eq 0 ]]; then
     exit 1
 fi
 
-echo "[delegate/batch] Dispatching $N_TASKS tasks (timeout: ${BATCH_TIMEOUT}s, per-task: ${CODEX_TIMEOUT}s)..." >&2
+echo "[delegate/batch] Dispatching $N_TASKS tasks (concurrency: ${BATCH_CONCURRENCY}, per-task timeout: ${CODEX_TIMEOUT}s)..." >&2
 
 # Cleanup on exit
 trap 'kill $(jobs -p) 2>/dev/null; wait' EXIT INT TERM
 
-# Launch all tasks in parallel
+# Count still-running launched tasks. bash reaps finished children into its job
+# table (no lingering zombies), so kill -0 is a reliable liveness probe here.
+_live_jobs() {
+    local n=0 pid
+    for pid in "${PIDS[@]+"${PIDS[@]}"}"; do
+        kill -0 "$pid" 2>/dev/null && n=$((n+1))
+    done
+    echo "$n"
+}
+
+# Launch tasks, at most BATCH_CONCURRENCY at a time (max tasks still need a
+# concurrency cap — unthrottled fan-out invites rate limits). Launch order is
+# preserved, so PIDS stays index-aligned with TASK_NAMES.
 for i in "${!TASK_NAMES[@]}"; do
+    while (( $(_live_jobs) >= BATCH_CONCURRENCY )); do
+        sleep 5
+    done
     echo "[delegate/batch]   ${TASK_NAMES[$i]} → ${OUTPUT_PATHS[$i]}" >&2
-    bash "$ASK_CODEX" "${PROMPT_ARGS[$i]}" "${OUTPUT_PATHS[$i]}" &
+    rm -f "${OUTPUT_PATHS[$i]}"
+    bash "$ASK_CODEX" "${CREDIT_ARGS[@]+"${CREDIT_ARGS[@]}"}" "${PROMPT_ARGS[$i]}" "${OUTPUT_PATHS[$i]}" &
     PIDS+=($!)
 done
 
@@ -150,7 +170,11 @@ done
 # Build summary string
 SUMMARY_PARTS=""
 for i in "${!TASK_NAMES[@]}"; do
-    SUMMARY_PARTS+=" ${TASK_NAMES[$i]}:${FINAL_STATUS[$i]}"
+    suffix=""
+    if head -1 "${OUTPUT_PATHS[$i]}" 2>/dev/null | grep -q 'fallback=codex-credit'; then
+        suffix="[deepseek]"
+    fi
+    SUMMARY_PARTS+=" ${TASK_NAMES[$i]}:${FINAL_STATUS[$i]}${suffix}"
 done
 
 echo "" >&2

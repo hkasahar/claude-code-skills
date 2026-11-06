@@ -19,6 +19,7 @@ Usage:
 Environment variables required:
     MATHPIX_APP_ID  - Your Mathpix app ID
     MATHPIX_APP_KEY - Your Mathpix app key
+    MATHPIX_API_BASE - API origin override (default https://api.mathpix.com; tests)
 """
 
 import argparse
@@ -26,6 +27,7 @@ import json
 import os
 import sys
 import time
+import secrets
 from pathlib import Path
 from typing import Optional
 
@@ -35,6 +37,47 @@ import requests
 # Retry configuration
 MAX_RETRIES: int = 3
 RETRY_DELAY: int = 5  # seconds
+
+
+def create_mathpix_session() -> requests.Session:
+    """Credentials must never inherit a proxy or netrc from the environment."""
+    session = requests.Session()
+    session.trust_env = False
+    return session
+
+
+def api_url(suffix: str = "") -> str:
+    # This override also permits the offline localhost HTTP contract test.
+    return os.environ.get("MATHPIX_API_BASE", "https://api.mathpix.com").rstrip("/") + "/v3/pdf" + suffix
+
+
+def refuse_redirect(response: requests.Response, operation: str) -> None:
+    if 300 <= response.status_code < 400:
+        print(f"Error: Mathpix {operation} redirect refused", file=sys.stderr)
+        sys.exit(2)
+
+
+def atomic_write_text(path: Path, text: str) -> None:
+    """Publish beside the target so an interrupted write leaves the old file intact."""
+    if path.is_symlink():
+        raise OSError("refusing a symlink output")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(f".{path.name}.{secrets.token_hex(12)}.tmp")
+    fd = None
+    try:
+        fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            fd = None
+            stream.write(text)
+            stream.flush()
+            os.fsync(stream.fileno())
+        if path.is_symlink():
+            raise OSError("refusing a symlink output")
+        os.replace(temp, path)
+    finally:
+        if fd is not None:
+            os.close(fd)
+        temp.unlink(missing_ok=True)
 
 
 def log(msg: str, verbose: bool = True) -> None:
@@ -76,13 +119,15 @@ def get_mathpix_credentials() -> tuple[str, str]:
 
 
 def upload_pdf_with_retry(
-    pdf_path: str, app_id: str, app_key: str, verbose: bool = False
+    pdf_path: str, app_id: str, app_key: str, verbose: bool = False,
+    max_attempts: int = MAX_RETRIES
 ) -> str:
     """Upload PDF to Mathpix with automatic retry on failure.
 
     Returns the Mathpix pdf_id on success. Exits with code 2 on failure.
     """
-    url = "https://api.mathpix.com/v3/pdf"
+    url = api_url()
+    session = create_mathpix_session()
 
     headers = {
         "app_id": app_id,
@@ -98,20 +143,22 @@ def upload_pdf_with_retry(
 
     last_error: Optional[str] = None
 
-    for attempt in range(1, MAX_RETRIES + 1):
+    for attempt in range(1, max_attempts + 1):
         try:
             if verbose and attempt > 1:
-                log(f"  Retry attempt {attempt}/{MAX_RETRIES}...")
+                log(f"  Retry attempt {attempt}/{max_attempts}...")
 
             with open(pdf_path, "rb") as f:
                 files = {
                     "file": (Path(pdf_path).name, f, "application/pdf"),
                     "options_json": (None, json.dumps(options), "application/json"),
                 }
-                response = requests.post(
-                    url, headers=headers, files=files, timeout=120
+                response = session.post(
+                    url, headers=headers, files=files, timeout=120,
+                    allow_redirects=False, verify=True
                 )
 
+            refuse_redirect(response, "upload")
             if response.status_code == 200:
                 result = response.json()
                 pdf_id = result.get("pdf_id")
@@ -126,13 +173,13 @@ def upload_pdf_with_retry(
         except requests.exceptions.RequestException as e:
             last_error = str(e)
 
-        if attempt < MAX_RETRIES:
+        if attempt < max_attempts:
             log(f"  Upload failed: {last_error}", verbose)
             log(f"  Waiting {RETRY_DELAY}s before retry...", verbose)
             time.sleep(RETRY_DELAY)
 
     print(
-        f"Error: Failed to upload PDF after {MAX_RETRIES} attempts", file=sys.stderr
+        f"Error: Failed to upload PDF after {max_attempts} attempts", file=sys.stderr
     )
     print(f"Last error: {last_error}", file=sys.stderr)
     sys.exit(2)
@@ -140,14 +187,17 @@ def upload_pdf_with_retry(
 
 def check_processing_status(pdf_id: str, app_id: str, app_key: str) -> dict:
     """Check the processing status of a PDF."""
-    url = f"https://api.mathpix.com/v3/pdf/{pdf_id}"
+    url = api_url(f"/{pdf_id}")
 
     headers = {
         "app_id": app_id,
         "app_key": app_key,
     }
 
-    response = requests.get(url, headers=headers, timeout=30)
+    response = create_mathpix_session().get(
+        url, headers=headers, timeout=30, allow_redirects=False, verify=True
+    )
+    refuse_redirect(response, "status")
     return response.json()
 
 
@@ -205,7 +255,8 @@ def get_markdown_result_with_retry(
 
     Returns the markdown string. Exits with code 2 on failure.
     """
-    url = f"https://api.mathpix.com/v3/pdf/{pdf_id}.md"
+    url = api_url(f"/{pdf_id}.md")
+    session = create_mathpix_session()
 
     headers = {
         "app_id": app_id,
@@ -219,7 +270,10 @@ def get_markdown_result_with_retry(
             if verbose and attempt > 1:
                 log(f"  Retry attempt {attempt}/{MAX_RETRIES}...")
 
-            response = requests.get(url, headers=headers, timeout=120)
+            response = session.get(
+                url, headers=headers, timeout=120, allow_redirects=False, verify=True
+            )
+            refuse_redirect(response, "result")
 
             if response.status_code == 200:
                 return response.text
@@ -284,7 +338,11 @@ environment variables:
         help="Print progress information to stderr",
     )
 
+    parser.add_argument("--max-attempts", type=int, default=MAX_RETRIES,
+                        help="Maximum upload POST attempts (default: 3)")
     args = parser.parse_args()
+    if args.max_attempts < 1:
+        parser.error("--max-attempts must be positive")
 
     # Validate input file
     pdf_path = Path(args.pdf_path)
@@ -303,12 +361,22 @@ environment variables:
         else:
             output_path = pdf_path.with_suffix(".md")
 
+    if output_path is not None and (
+        output_path.resolve() == pdf_path.resolve()
+        or (output_path.exists() and os.path.samefile(output_path, pdf_path))
+    ):
+        print("Error: output must differ from input PDF", file=sys.stderr)
+        sys.exit(1)
+    if output_path is not None and output_path.is_symlink():
+        print("Error: refusing a symlink output", file=sys.stderr)
+        sys.exit(1)
+
     # 1. Get credentials
     app_id, app_key = get_mathpix_credentials()
 
     # 2. Upload PDF
     log(f"Uploading {pdf_path.name} to Mathpix...", args.verbose)
-    pdf_id = upload_pdf_with_retry(str(pdf_path), app_id, app_key, args.verbose)
+    pdf_id = upload_pdf_with_retry(str(pdf_path), app_id, app_key, args.verbose, args.max_attempts)
     log(f"PDF ID: {pdf_id}", args.verbose)
 
     # 3. Poll for completion
@@ -326,8 +394,11 @@ environment variables:
     else:
         # Convert mode: write to file
         assert output_path is not None
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text(markdown)
+        try:
+            atomic_write_text(output_path, markdown)
+        except OSError as exc:
+            print(f"Error: cannot write output: {exc}", file=sys.stderr)
+            sys.exit(1)
         # Print path to stdout so callers can find it
         print(str(output_path))
         log(f"Wrote {len(markdown):,} chars to {output_path}", args.verbose)

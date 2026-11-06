@@ -6,12 +6,13 @@ Two modes:
     python3 sync_to_reference.py --key KEY --pdf /path/to.pdf --md /path/to.md \
         [--sidecar /path/to.json] [--central-ref /path/to/reference]
 
-  Batch (sync a whole project reference folder at once):
+  Batch sync from an explicitly selected source directory:
     python3 sync_to_reference.py --batch --ref-dir /path/to/project/ref/ \
         [--central-ref /path/to/reference]
 
-All operations are skip-if-exists (no overwrites, no duplicates).
-Exit codes: 0 = success, 1 = error.
+An explicit destination is required by flag or environment.
+Existing copies are retained unless --force is selected; BibTeX entries are not replaced.
+Exit codes: 0 = success, 1 = operational error, 2 = argument error.
 """
 
 import argparse
@@ -22,20 +23,12 @@ import shutil
 import sys
 from datetime import datetime
 
-# Opt-in: no default path. Resolve from --central-ref or GEMINI_PDF_REFERENCE_DIR.
-DEFAULT_CENTRAL_REF = os.environ.get("GEMINI_PDF_REFERENCE_DIR")
+DEFAULT_CENTRAL_REF = os.environ.get("GEMINI_PDF_REFERENCE_DIR") or os.environ.get("REFERENCE_DIR")
 
-# Copied from generate_bib.py — keep in sync
-BOOK_KEYS = {
-    "coverandthomas2006", "hall1980martingale", "rao1973",
-    "tsybakov2009", "vaart1998", "lattimore2020bandit", "stewart1990",
-}
-
-
-# --- Author formatting (copied from generate_bib.py — keep in sync) ---
+# --- Author formatting ---
 
 def format_author_bibtex(name):
-    """Format author name for BibTeX. Handle particles like 'van der Vaart'."""
+    """Format author names for BibTeX, retaining multiword family-name particles."""
     particles = ["van der", "van den", "van", "de la", "de", "di", "el"]
     name = name.strip()
     parts = name.split()
@@ -64,9 +57,7 @@ def format_authors_bibtex(authors):
 
 
 def determine_entry_type(key, venue):
-    """Determine BibTeX entry type from key and venue."""
-    if key in BOOK_KEYS:
-        return "book"
+    """Infer a generic BibTeX type from venue; no personal citekey registry."""
     if not venue:
         return "techreport"
     venue_lower = venue.lower()
@@ -189,7 +180,8 @@ def load_sidecar(key, pdf_path, sidecar_path, central_ref):
 def build_bib_entry(key, metadata):
     """Build a BibTeX entry string from metadata dict."""
     venue = metadata.get("venue", "") or metadata.get("journal", "") or ""
-    entry_type = determine_entry_type(key, venue)
+    explicit_type = metadata.get("entry_type", metadata.get("type", ""))
+    entry_type = explicit_type if isinstance(explicit_type, str) and explicit_type in {"article", "book", "inproceedings", "techreport", "misc"} else determine_entry_type(key, venue)
 
     fields = []
 
@@ -431,11 +423,14 @@ def main():
                         help="Batch mode: sync all PDFs from --ref-dir")
     parser.add_argument("--ref-dir", help="Reference directory for batch mode")
     parser.add_argument("--central-ref", default=DEFAULT_CENTRAL_REF,
-                        help="Central reference library path (opt-in; or set GEMINI_PDF_REFERENCE_DIR)")
+                        help="Explicit destination, or set GEMINI_PDF_REFERENCE_DIR (REFERENCE_DIR is also supported)")
     parser.add_argument("--force", action="store_true",
                         help="Overwrite existing PDF/MD copies (bib entries are never replaced)")
 
     args = parser.parse_args()
+
+    if not args.central_ref:
+        parser.error("an explicit --central-ref or GEMINI_PDF_REFERENCE_DIR/REFERENCE_DIR is required")
 
     if args.batch:
         if not args.ref_dir:
@@ -444,18 +439,8 @@ def main():
         if not os.path.isdir(args.ref_dir):
             print(f"ERROR: ref-dir not found: {args.ref_dir}", file=sys.stderr)
             return 1
-        if not args.central_ref:
-            print("[sync] No central reference library configured — skipping "
-                  "(pass --central-ref or set GEMINI_PDF_REFERENCE_DIR to enable).",
-                  file=sys.stderr)
-            return 0
         sync_batch(os.path.abspath(args.ref_dir), os.path.abspath(args.central_ref))
     elif args.key:
-        if not args.central_ref:
-            print("[sync] No central reference library configured — skipping "
-                  "(pass --central-ref or set GEMINI_PDF_REFERENCE_DIR to enable).",
-                  file=sys.stderr)
-            return 0
         sync_single(
             key=args.key,
             pdf_path=args.pdf,

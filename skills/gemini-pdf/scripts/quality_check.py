@@ -17,10 +17,12 @@ import argparse
 from collections import Counter
 from dataclasses import dataclass
 import json
+import math
 import os
 import re
 import subprocess
 import sys
+import unicodedata
 from typing import Any, Optional
 
 
@@ -39,6 +41,24 @@ STRAY_SENTINEL_RE = re.compile(
 
 DISPLAY_MATH_RE = re.compile(r"\$\$.*?\$\$", re.DOTALL)
 INLINE_MATH_RE = re.compile(r"(?<!\\)\$(?!\$)(?!\s?\d).*?(?<!\\)\$", re.DOTALL)
+# Digit-started cells such as $0.019$ made the legacy DOTALL matcher treat
+# their closing dollar as an opener and swallow later prose. Keep that legacy
+# behavior for document scores, whose historical values are an API contract.
+INLINE_MATH_RE_CHUNK = re.compile(r"(?<!\\)\$(?!\$)(?:[^$\n\\]|\\.)+?(?<!\\)\$")
+ACTIVE_PROFILE = "document"
+DOI_RE = re.compile(r"10\.\d{4,9}/[^\s\]\)>,]+", re.IGNORECASE)
+# PDF text layers commonly break DOI suffixes after slashes and periods.
+SOURCE_DOI_RE = re.compile(r"10\.\s*\d{4,9}/\s*[^\s\]\)>,/.]+(?:[/.]\s*[^\s\]\)>,/.]+)*", re.IGNORECASE)
+AUDIT_MARKER_RE = re.compile(r"<!--\s*AUDIT\b[^>]*-->", re.IGNORECASE)
+SENTENCE_WORD_RE = re.compile(r"[a-z][a-z']+")
+LOWERCASE_WORD_RE = re.compile(r"\b[a-z][a-z']+\b")
+NUMERIC_ONLY_LINE_RE = re.compile(r"^\s*[-−+]?\d+(?:\.\d+)?%?\s*$")
+EQUATION_TAG_LINE_RE = re.compile(r"^\s*\((?:[A-Za-z]\.)?\d+(?:\.\d+)*\)\s*$")
+FIGURE_LABEL_RE = re.compile(r"^\s*(?:Figure\b|Panel\b|Notes:)", re.IGNORECASE)
+PROSE_WORD_RE = re.compile(r"\b[^\W\d_]{3,}\b")
+SENTENCE_TOKEN_RE = re.compile(r"\b[^\W_]+\b")
+MATH_ARGUMENT_RE = re.compile(r"\([0-9a-z]\)")
+SENTENCE_MATH_SYMBOLS = set("∈∉≤≥≠⊤⊥∑∏∫∞→←↔⇒·×±∂∇√")
 LATEX_ENV_RE = re.compile(
     r"\\begin\{(?P<env>[A-Za-z][A-Za-z0-9*_-]*)\}.*?\\end\{(?P=env)\}",
     re.DOTALL,
@@ -199,7 +219,8 @@ def delatex_text(text: str) -> str:
     """Remove common LaTeX math blocks, inline math spans, environments, and commands."""
     text = DISPLAY_MATH_RE.sub(" ", text)
     text = LATEX_ENV_RE.sub(" ", text)
-    text = INLINE_MATH_RE.sub(" ", text)
+    inline_math = INLINE_MATH_RE_CHUNK if ACTIVE_PROFILE == "chunk" else INLINE_MATH_RE
+    text = inline_math.sub(" ", text)
     text = LATEX_COMMAND_RE.sub(" ", text)
     return text
 
@@ -586,19 +607,29 @@ def extract_numeric_tokens_by_line(text: str) -> tuple[list[str], dict[str, set[
     return tokens, line_numbers
 
 
-def score_numeric_fidelity(
-    source_text: str,
-    md_text: str,
-    page_count: Optional[int],
-) -> tuple[int, str]:
-    """Score multiset recall of source numeric tokens in markdown output."""
+def numeric_source_counter(source_text: str, page_count: Optional[int], *,
+                           page_number_run: Optional[dict[str, int]] = None,
+                           repeated_lines: Optional[set[str]] = None) -> tuple[Counter[str], set[str]]:
+    """Share the legacy boilerplate filter so raw gates and document scores agree."""
     source_tokens, source_line_numbers = extract_numeric_tokens_by_line(source_text)
-    output_tokens, _ = extract_numeric_tokens_by_line(md_text)
 
     dropped_tokens: set[str] = set()
+    if ACTIVE_PROFILE == "chunk":
+        if page_number_run is None:
+            page_number_run = detect_page_number_run(split_pages_formfeed(source_text))
+        # Detect axes before repetition filtering can break their source runs.
+        filtered, _ = filter_figure_axis_lines(source_text)
+        filtered = filter_chunk_source_lines(filtered, repeated_lines)
+        filtered_tokens, source_line_numbers = extract_numeric_tokens_by_line(filtered)
+        # A body occurrence remains evidence even if the same number is in a footer.
+        dropped_tokens = set(source_tokens) - set(filtered_tokens)
+        source_tokens = filtered_tokens
+        if page_number_run:
+            dropped_tokens.update(str(n) for n in range(page_number_run["start"] - 1,
+                                                        page_number_run["end"] + 2))
     if page_count is not None and page_count > 0:
         line_frequency_threshold = max(3.0, page_count / 2)
-        dropped_tokens = {
+        dropped_tokens |= {
             token
             for token, lines in source_line_numbers.items()
             if len(lines) >= line_frequency_threshold
@@ -611,7 +642,7 @@ def score_numeric_fidelity(
             int(t) for t in source_line_numbers
             if t.isdigit() and 2 <= len(t) <= 5
         }
-        if pure_ints and page_count >= 4:
+        if ACTIVE_PROFILE != "chunk" and pure_ints and page_count >= 4:
             best_start, best_cover = None, 0
             for start in pure_ints:
                 cover = sum(1 for k in range(page_count) if (start + k) in pure_ints)
@@ -629,9 +660,30 @@ def score_numeric_fidelity(
     for token in list(source_counter):
         source_counter[token] = min(source_counter[token], 5)
 
+    return source_counter, dropped_tokens
+
+
+def score_numeric_fidelity(
+    source_text: str,
+    md_text: str,
+    page_count: Optional[int],
+    *,
+    page_number_run: Optional[dict[str, int]] = None,
+    repeated_lines: Optional[set[str]] = None,
+) -> tuple[int, str]:
+    """Score multiset recall of source numeric tokens in markdown output."""
+    source_counter, dropped_tokens = numeric_source_counter(
+        source_text, page_count, page_number_run=page_number_run, repeated_lines=repeated_lines)
+    run_details = (f"; page_number_run {page_number_run['start']}-{page_number_run['end']} dropped"
+                   if page_number_run else "")
+    if ACTIVE_PROFILE == "chunk":
+        _, axis_runs = filter_figure_axis_lines(source_text)
+        run_details += f"; figure_axis_runs {json.dumps(axis_runs)} dropped"
+    output_tokens, _ = extract_numeric_tokens_by_line(md_text)
+
     total = sum(source_counter.values())
     if total == 0:
-        return 100, "no source numeric tokens after filtering"
+        return 100, "no source numeric tokens after filtering" + run_details
 
     output_counter = Counter(output_tokens)
     matched = sum(min(count, output_counter[token]) for token, count in source_counter.items())
@@ -647,7 +699,7 @@ def score_numeric_fidelity(
     return (
         score,
         f"recall {recall:.2f} ({matched}/{total} capped tokens, "
-        f"{len(dropped_tokens)} boilerplate tokens dropped)",
+        f"{len(dropped_tokens)} boilerplate tokens dropped)" + run_details,
     )
 
 
@@ -673,12 +725,131 @@ def drop_repeated_source_lines(source_text: str) -> str:
     return "\n".join(kept_lines)
 
 
+def repeated_source_lines(source_text: str) -> set[str]:
+    counts = Counter(normalize_line_for_repetition(line) for line in source_text.splitlines())
+    return {line for line, count in counts.items() if line and count >= 3}
+
+
+def is_source_furniture(line: str, repeated_lines: set[str]) -> bool:
+    normalized = normalize_line_for_repetition(line)
+    return (normalized in repeated_lines or bool(URL_RE.search(line))
+            or bool(re.match(r"\s*(?:downloaded from|published under a creative commons|"
+                             r"international \(cc by)", line, re.IGNORECASE))
+            or "©" in line
+            or (len(re.findall(r"[A-Za-z]+", line)) >= 4 and not re.search(r"[a-z]", line)))
+
+
+def filter_chunk_source_lines(source_text: str, repeated_lines: Optional[set[str]] = None,
+                              *, sentences: bool = False) -> str:
+    if repeated_lines is None:
+        repeated_lines = repeated_source_lines(source_text)
+    return "\n".join(line for line in source_text.splitlines()
+                     if not is_source_furniture(line, repeated_lines)
+                     and (not sentences or len(LOWERCASE_WORD_RE.findall(fold_ligatures(line))) >= 4))
+
+
+def is_figure_axis_number(line: str) -> bool:
+    """Equation tags remain source evidence, even beside numeric runs or captions."""
+    return not EQUATION_TAG_LINE_RE.fullmatch(line) and bool(NUMERIC_ONLY_LINE_RE.fullmatch(line))
+
+
+def filter_figure_axis_lines(source_text: str) -> tuple[str, list[list[float]]]:
+    """Remove numeric-only axis runs, preserving body occurrences of their values.
+
+    A round grid must be coarser than the printed precision: otherwise any
+    decimal table would lie on a sufficiently fine grid. AP subruns allow
+    adjacent axes with different steps to share a reading-order numeric block.
+    """
+    runs: list[list[float]] = []
+    filtered_pages: list[str] = []
+    for page in source_text.split("\f"):
+        lines = page.split("\n")
+        excluded: set[int] = set()
+        block: list[int] = []
+
+        def inspect(indices: list[int]) -> None:
+            if len(indices) < 3:
+                return
+            values = [float(lines[i].strip().replace("−", "-").rstrip("%")) for i in indices]
+            if not all(math.isfinite(value) for value in values):
+                return
+            marked: set[int] = set()
+            precision = max(len(line.split(".")[1].rstrip("%")) if "." in line else 0
+                            for line in (lines[i].strip() for i in indices))
+            minimum_step = 5 * 10.0 ** -min(precision, 2)
+            # Fine table estimates need an AP, not merely a shared decimal
+            # grid. Coarse ticks may interleave panels on a .05/.25 grid.
+            ratios = [value / minimum_step for value in values]
+            if precision < 3 and all(math.isfinite(ratio) and math.isclose(ratio, round(ratio),
+                                                                         rel_tol=1e-9) for ratio in ratios):
+                marked.update(range(len(indices)))
+            else:
+                start = 0
+                while start + 2 < len(values):
+                    step = values[start + 1] - values[start]
+                    end = start + 2
+                    while end < len(values) and math.isclose(values[end] - values[end - 1], step,
+                                                            rel_tol=1e-9):
+                        end += 1
+                    if end - start >= 3:
+                        marked.update(range(start, end))
+                        start = end - 1
+                    else:
+                        start += 1
+            excluded.update(indices[i] for i in marked)
+
+        for index, line in enumerate(lines + ["END"]):
+            if is_figure_axis_number(line):
+                block.append(index)
+            elif line.strip():
+                inspect(block)
+                block = []
+        labels = [i for i, line in enumerate(lines) if FIGURE_LABEL_RE.match(line)]
+        for index, line in enumerate(lines):
+            if is_figure_axis_number(line) and any(0 < abs(index - label) <= 3 for label in labels):
+                excluded.add(index)
+        # Report excluded source sequences, including short caption neighbors.
+        current: list[float] = []
+        for index, line in enumerate(lines + ["END"]):
+            if index in excluded:
+                current.append(float(line.strip().replace("−", "-").rstrip("%")))
+            elif line.strip() and current:
+                runs.append(current)
+                current = []
+        filtered_pages.append("\n".join("" if i in excluded else line for i, line in enumerate(lines)))
+    return "\f".join(filtered_pages), runs
+
+
+def detect_page_number_run(pages: dict[int, str]) -> Optional[dict[str, int]]:
+    """Identify pagination by a common printed-number minus PDF-page offset."""
+    offsets: dict[int, set[int]] = {}
+    for page, text in pages.items():
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        candidates: set[int] = set()
+        for index, line in enumerate(lines):
+            if re.fullmatch(r"\d+", line):
+                candidates.add(int(line))
+            elif index < 3 or index >= len(lines) - 3:
+                candidates.update(int(token) for token in line.split() if token.isdigit())
+        for number in candidates:
+            offsets.setdefault(number - page, set()).add(page)
+    if not offsets:
+        return None
+    # At least two pages are needed to distinguish a run from an isolated integer.
+    offset, matched_pages = max(offsets.items(), key=lambda item: (len(item[1]), -item[0]))
+    if len(matched_pages) < max(2, math.ceil(0.6 * len(pages))):
+        return None
+    return {"start": min(matched_pages) + offset, "end": max(matched_pages) + offset}
+
+
 def normalize_for_trigrams(text: str, *, drop_repeated_lines: bool) -> str:
     """Normalize text for source/output trigram comparison."""
     if drop_repeated_lines:
         text = drop_repeated_source_lines(text)
 
     text = fold_ligatures(text)
+    if ACTIVE_PROFILE == "chunk":
+        text = unicodedata.normalize("NFKC", text)
     text = HYPHENATED_LINEBREAK_RE.sub("", text)
     text = delatex_text(text)
     text = text.lower()
@@ -746,6 +917,38 @@ COMPARISON_WEIGHTS: dict[str, float] = {
 }
 
 
+CHUNK_WEIGHTS: dict[str, float] = {
+    "content_completeness": 0.30, "math_quality": 0.20,
+    "structural_integrity": 0.0, "ocr_artifacts": 0.10,
+    "failed_chunks": 0.0, "numeric_fidelity": 0.25, "trigram_recall": 0.15,
+}
+CHUNK_WEAK_WEIGHTS: dict[str, float] = {
+    "content_completeness": 0.50, "math_quality": 0.30,
+    "structural_integrity": 0.0, "ocr_artifacts": 0.20, "failed_chunks": 0.0,
+}
+CHUNK_FLOORS: dict[str, float] = {
+    "completeness": 60, "math": 85, "ocr": 70, "numeric": 0.80,
+    "trigram": 0.55, "page_trigram_min": 0.15, "uncertain": 8,  # Math serialization can reduce per-page trigram recall; sentence checks also detect omissions.
+    "missing_sentences_page_max": 1, "missing_sentences_max": 3,
+    "injected_dois": 0,
+}
+
+
+def parse_chunk_floors(items: list[str]) -> dict[str, float]:
+    """Reject misspelled or non-finite overrides rather than silently weakening a gate."""
+    floors = dict(CHUNK_FLOORS)
+    for item in items:
+        key, separator, raw = item.partition("=")
+        key = key.strip()
+        if not separator or key not in floors:
+            raise ValueError(f"unknown chunk floor: {item}")
+        value = float(raw)
+        if not math.isfinite(value) or value < 0:
+            raise ValueError(f"chunk floor must be finite and nonnegative: {item}")
+        floors[key] = value
+    return floors
+
+
 def compute_weights(math_doc: bool, source_available: bool) -> dict[str, float]:
     """Redistribute math weight if document is non-mathematical."""
     weights = dict(SOURCE_WEIGHTS if source_available else DEFAULT_WEIGHTS)
@@ -793,14 +996,224 @@ def build_eligibility_reasons(
     return reasons
 
 
+def numeric_fidelity_values(source_text: str, md_text: str,
+                            page_count: Optional[int], *,
+                            page_number_run: Optional[dict[str, int]] = None,
+                            repeated_lines: Optional[set[str]] = None) -> dict[str, Any]:
+    source_counter, dropped = numeric_source_counter(
+        source_text, page_count, page_number_run=page_number_run, repeated_lines=repeated_lines)
+    output_counter = Counter(extract_numeric_tokens_by_line(md_text)[0])
+    total = sum(source_counter.values())
+    matched = sum(min(count, output_counter[token]) for token, count in source_counter.items())
+    absent = source_counter - output_counter
+    return {"recall": matched / total if total else 1.0, "total": total,
+            "matched": matched, "missing": list(absent.elements()),
+            "boilerplate_tokens_dropped": len(dropped),
+            "figure_axis_runs": filter_figure_axis_lines(source_text)[1] if ACTIVE_PROFILE == "chunk" else []}
+
+
+def split_pages_formfeed(source_text: str, first_page: int = 1) -> dict[int, str]:
+    pages = source_text.split("\f")
+    # pdftotext emits a terminal form feed, which does not introduce a blank page.
+    if len(pages) > 1 and not pages[-1].strip():
+        pages.pop()
+    return {first_page + offset: text for offset, text in enumerate(pages)}
+
+
+def read_page_texts(source_text: str, first_page: int,
+                    page_texts_dir: Optional[str]) -> dict[int, str]:
+    if page_texts_dir:
+        pages: dict[int, str] = {}
+        for name in sorted(os.listdir(page_texts_dir)):
+            match = re.search(r"(?:^|[_-])(\d+)\.txt$", name)
+            if match:
+                pages[int(match.group(1))] = read_text_file(os.path.join(page_texts_dir, name))
+        if pages:
+            return dict(sorted(pages.items()))
+    return split_pages_formfeed(source_text, first_page)
+
+
+def sentence_math_evidence(text: str) -> tuple[int, int, int]:
+    characters = sum(ch in SENTENCE_MATH_SYMBOLS or "GREEK" in unicodedata.name(ch, "")
+                     or unicodedata.category(ch).startswith("M") for ch in text)
+    characters += sum(len(match.group()) for match in MATH_ARGUMENT_RE.finditer(text))
+    tokens = SENTENCE_TOKEN_RE.findall(text)
+    single_letters = sum(len(token) == 1 and token.isalpha() for token in tokens)
+    return characters, single_letters, len(tokens)
+
+
+def missing_sentence_check(source_text: str,
+                           candidate_trigrams: set[tuple[str, str, str]], *,
+                           repeated_lines: Optional[set[str]] = None) -> dict[str, Any]:
+    chunk = ACTIVE_PROFILE == "chunk"
+    if chunk:
+        source_text = filter_chunk_source_lines(source_text, repeated_lines)
+        lines = []
+        for line in source_text.splitlines():
+            characters, single_letters, _ = sentence_math_evidence(line)
+            # Keep the existing prose/furniture screen, retaining mathematical
+            # continuations so line wrapping cannot erase eligibility evidence.
+            if (len(LOWERCASE_WORD_RE.findall(fold_ligatures(line))) >= 4
+                    or characters or (single_letters and not PROSE_WORD_RE.search(line))):
+                lines.append(line)
+        # Measure before NFKC composes accents or delatex strips variables.
+        normalized = WHITESPACE_RE.sub(" ", HYPHENATED_LINEBREAK_RE.sub("", fold_ligatures("\n".join(lines))))
+    else:
+        normalized = normalize_for_trigrams(source_text, drop_repeated_lines=True)
+    sentences = 0
+    missing = 0
+    math_skipped = 0
+    heads: list[str] = []
+    for sentence in re.split(r"[.!?]\s+", normalized):
+        sentence = sentence.strip()
+        if len((PROSE_WORD_RE if chunk else SENTENCE_WORD_RE).findall(sentence)) < 8:
+            continue
+        if chunk:
+            eligibility_text = WHITESPACE_RE.sub(" ", sentence)
+            math_characters, single_letters, tokens = sentence_math_evidence(eligibility_text)
+            if (math_characters / max(1, len(eligibility_text)) >= 0.03
+                    or single_letters / max(1, tokens) >= 0.25):
+                math_skipped += 1
+                continue
+        if sum(ch.isdigit() for ch in sentence) / max(1, len(sentence)) >= 0.15:
+            continue
+        if chunk:
+            sentence = normalize_for_trigrams(sentence, drop_repeated_lines=True)
+        trigrams = word_trigrams(sentence)
+        if not trigrams:
+            continue
+        sentences += 1
+        if len(trigrams & candidate_trigrams) / len(trigrams) < 0.25:
+            missing += 1
+            if len(heads) < 6:
+                heads.append(sentence[:90])
+    result = {"sentences": sentences, "missing_sentences": {"count": missing, "heads": heads}}
+    if chunk:
+        result["math_skipped"] = math_skipped
+    return result
+
+
+def injected_doi_values(source_text: str, md_text: str, doc_text: str = "") -> list[str]:
+    # DOI names are case-insensitive; terminal prose punctuation is not part of one.
+    def names(text: str, pattern: re.Pattern[str] = DOI_RE) -> set[str]:
+        return {re.sub(r"\s+", "", match.rstrip(".;:\"'*").lower()) for match in pattern.findall(text)}
+    # Keep each text separate: concatenating pages/documents without a separator
+    # can manufacture DOI evidence across unrelated source boundaries.
+    sources = [source_text, doc_text]
+    printed = set().union(*(names(text, SOURCE_DOI_RE) for text in sources))
+    compact_sources = [re.sub(r"\s+", "", text.lower()) for text in sources]
+    return sorted(doi for doi in names(md_text) - printed
+                  if not any(doi in text for text in compact_sources))
+
+
+def score_pages(pages: dict[int, str], md_text: str) -> dict[str, Any]:
+    candidate_trigrams = word_trigrams(normalize_for_trigrams(md_text, drop_repeated_lines=False))
+    checks: dict[str, Any] = {}
+    page_number_run = detect_page_number_run(pages)
+    repeated_lines = repeated_source_lines("\n".join(pages.values()))
+    for page, text in pages.items():
+        source_trigrams = word_trigrams(normalize_for_trigrams(text, drop_repeated_lines=True))
+        numeric = numeric_fidelity_values(text, md_text, None,
+                                          page_number_run=page_number_run, repeated_lines=repeated_lines)
+        checks[str(page)] = {
+            "trigrams": len(source_trigrams),
+            "trigram_recall": len(source_trigrams & candidate_trigrams) / len(source_trigrams) if source_trigrams else 1.0,
+            "numerals": numeric["total"], "numeric_recall": numeric["recall"],
+            "missing_numerals": numeric["missing"][:12],
+            "figure_axis_runs": numeric["figure_axis_runs"],
+            **missing_sentence_check(text, candidate_trigrams, repeated_lines=repeated_lines),
+        }
+    return checks
+
+
+def add_chunk_profile(report: dict[str, Any], md_text: str, source_text: str,
+                      page_count: Optional[int], source_available: bool,
+                      first_page: int, page_texts_dir: Optional[str],
+                      floor_overrides: Optional[dict[str, float]],
+                      candidate_raw: Optional[str] = None,
+                      doc_text: str = "") -> None:
+    floors = dict(CHUNK_FLOORS)
+    if floor_overrides:
+        floors.update(floor_overrides)
+    dimensions = report["dimensions"]
+    values: dict[str, Any] = {
+        "completeness": dimensions["content_completeness"]["score"],
+        "math": dimensions["math_quality"]["score"],
+        "ocr": dimensions["ocr_artifacts"]["score"],
+        "score": report["overall_score"], "uncertain": report["uncertain_markers"],
+        "completeness_ratio": measured_length(md_text) / measured_length(source_text) if source_available else None,
+        "numeric": None, "trigram": None, "page_trigram_min": None,
+        "missing_sentences": None, "sentences": None, "math_skipped": None,
+        "missing_sentences_page_max": None, "missing_sentences_max": None,
+        "injected_dois": None,
+    }
+    page_checks: dict[str, Any] = {}
+    missing: list[str] = []
+    injected: list[str] = []
+    page_number_run = None
+    axis_runs: list[list[float]] = []
+    if source_available:
+        pages = read_page_texts(source_text, first_page, page_texts_dir)
+        page_number_run = detect_page_number_run(pages)
+        repeated_lines = repeated_source_lines("\n".join(pages.values()))
+        numeric = numeric_fidelity_values(source_text, md_text, page_count,
+                                          page_number_run=page_number_run, repeated_lines=repeated_lines)
+        missing = numeric["missing"][:25]
+        axis_runs = numeric["figure_axis_runs"]
+        values["numeric"] = numeric["recall"]
+        source_tri = word_trigrams(normalize_for_trigrams(source_text, drop_repeated_lines=True))
+        output_tri = word_trigrams(normalize_for_trigrams(md_text, drop_repeated_lines=False))
+        values["trigram"] = len(source_tri & output_tri) / len(source_tri) if source_tri else 1.0
+        page_checks = score_pages(pages, md_text)
+        eligible_pages = [v["trigram_recall"] for v in page_checks.values() if v["trigrams"] >= 40]
+        values["page_trigram_min"] = min(eligible_pages) if eligible_pages else None
+        missing_counts = [v["missing_sentences"]["count"] for v in page_checks.values()]
+        values["missing_sentences_page_max"] = max(missing_counts, default=0)
+        values["missing_sentences"] = values["missing_sentences_max"] = sum(missing_counts)
+        values["sentences"] = sum(v["sentences"] for v in page_checks.values())
+        values["math_skipped"] = sum(v["math_skipped"] for v in page_checks.values())
+        # Front matter is generated content too: a fabricated YAML doi must
+        # fail even when the transcribed body contains no DOI at all.
+        injected = injected_doi_values("\f".join(pages.values()) + "\n" + source_text,
+                                       candidate_raw if candidate_raw is not None else md_text, doc_text)
+        values["injected_dois"] = len(injected)
+    lower_bounds = ["completeness", "math", "ocr"]
+    upper_bounds: list[str] = []
+    if source_available:
+        lower_bounds += ["numeric", "trigram", "page_trigram_min"]
+        upper_bounds += ["uncertain", "missing_sentences_page_max", "missing_sentences_max", "injected_dois"]
+    failed = [key for key in lower_bounds if values[key] is not None and values[key] < floors[key]]
+    failed += [key for key in upper_bounds if values[key] > floors[key]]
+    if report["overall_score"] < report["threshold"]:
+        failed.append("score")
+    report.update({
+        "profile": "chunk", "chunk_gate": {"pass": not failed, "failed": failed, "values": values, "floors": floors},
+        "page_checks": page_checks, "missing_numerals": missing,
+        "page_number_run": page_number_run,
+        "figure_axis_runs": axis_runs, "math_skipped": values["math_skipped"],
+        "missing_sentences": values["missing_sentences"], "sentences": values["sentences"],
+        "injected_dois": values["injected_dois"], "injected_doi_list": injected[:10],
+        "det_weak": not source_available, "audit_markers": len(AUDIT_MARKER_RE.findall(md_text)),
+    })
+    report["pass"] = report["chunk_gate"]["pass"]
+
+
 def run_quality_check(
     md_path: str,
     pdf_path: Optional[str],
     source_text_path: Optional[str],
     threshold: int,
     meta_json_path: Optional[str] = None,
+    *,
+    profile: str = "document",
+    first_page: int = 1,
+    page_texts_dir: Optional[str] = None,
+    floors: Optional[dict[str, float]] = None,
+    doc_text_path: Optional[str] = None,
 ) -> dict[str, Any]:
     """Run all scoring dimensions and return the report dict."""
+    global ACTIVE_PROFILE
+    ACTIVE_PROFILE = profile
     md_text_raw = read_text_file(md_path)
     md_text, front_matter = strip_front_matter(md_text_raw)
     md_text, stray_sentinels = strip_stray_sentinels(md_text)
@@ -820,8 +1233,18 @@ def run_quality_check(
         source_available = False
 
     page_count = get_page_count(pdf_path)
+    page_number_run = None
+    repeated_lines = None
+    if profile == "chunk" and source_available:
+        pages = read_page_texts(source_text or "", first_page, page_texts_dir)
+        page_number_run = detect_page_number_run(pages)
+        repeated_lines = repeated_source_lines("\n".join(pages.values()))
+        if page_count is None:
+            page_count = len(pages)
     math_doc = is_mathematical(md_text, source_text)
     weights = compute_weights(math_doc, source_available)
+    if profile == "chunk":
+        weights = dict(CHUNK_WEIGHTS if source_available else CHUNK_WEAK_WEIGHTS)
 
     source_for_scoring = source_text if source_available else None
     cc_score, cc_details = score_content_completeness(md_text, page_count, source_for_scoring)
@@ -839,7 +1262,8 @@ def run_quality_check(
     }
 
     if source_available and source_text is not None:
-        nf_score, nf_details = score_numeric_fidelity(source_text, md_text, page_count)
+        nf_score, nf_details = score_numeric_fidelity(source_text, md_text, page_count,
+                                                     page_number_run=page_number_run, repeated_lines=repeated_lines)
         tr_score, tr_details = score_trigram_recall(source_text, md_text)
         dimension_scores["numeric_fidelity"] = (nf_score, nf_details)
         dimension_scores["trigram_recall"] = (tr_score, tr_details)
@@ -874,7 +1298,7 @@ def run_quality_check(
 
     eligibility_reasons = build_eligibility_reasons(dimensions, fc_stats, source_available)
 
-    return {
+    report = {
         "overall_score": overall_score,
         "pass": overall_score >= threshold,
         "threshold": threshold,
@@ -891,6 +1315,11 @@ def run_quality_check(
         "stray_sentinels": stray_sentinels,
         "source_corrupted": source_corrupted,
     }
+    if profile == "chunk":
+        add_chunk_profile(report, md_text, source_text or "", page_count,
+                          source_available, first_page, page_texts_dir, floors, md_text_raw,
+                          read_text_file(doc_text_path) if doc_text_path else "")
+    return report
 
 
 def write_json_file(path: str, json_text: str) -> Optional[str]:
@@ -946,7 +1375,26 @@ def main() -> None:
         help="Optional per-chunk metadata JSON for failed-chunk scoring.",
     )
 
+    parser.add_argument("--profile", choices=("document", "chunk"), default="document")
+    parser.add_argument("--first-page", type=int, default=1)
+    parser.add_argument("--page-texts-dir", default=None,
+                        help="Per-paper-page UTF-8 text files (page_N.txt or N.txt).")
+    parser.add_argument("--doc-text", default=None,
+                        help="Whole-document reading-order text, used only to check DOI provenance.")
+    parser.add_argument("--floor", action="append", default=[], metavar="K=V",
+                        help="Override one chunk floor; repeatable, overrides the environment.")
     args = parser.parse_args()
+    global ACTIVE_PROFILE
+    ACTIVE_PROFILE = args.profile
+    floors = None
+    if args.profile == "chunk":
+        if args.first_page < 1:
+            parser.error("--first-page must be positive")
+        floor_items = [v for v in os.environ.get("GEMINI_PDF_CHUNK_FLOORS", "").split(",") if v.strip()]
+        try:
+            floors = parse_chunk_floors(floor_items + args.floor)
+        except ValueError as exc:
+            parser.error(str(exc))
 
     report = run_quality_check(
         md_path=args.md,
@@ -954,6 +1402,11 @@ def main() -> None:
         source_text_path=args.source_text,
         threshold=args.threshold,
         meta_json_path=args.meta_json,
+        profile=args.profile,
+        first_page=args.first_page,
+        page_texts_dir=args.page_texts_dir,
+        floors=floors,
+        doc_text_path=args.doc_text,
     )
 
     json_text = json.dumps(report, indent=2)

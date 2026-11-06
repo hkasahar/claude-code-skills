@@ -1,0 +1,26 @@
+#!/bin/bash
+set -euo pipefail
+if [[ "${FAKE_BIND_FAIL:-0}" == 1 ]]; then
+    for arg in "$@"; do
+        case "$arg" in
+            *socket.bind*|*s.bind*) exit 1 ;;
+        esac
+    done
+fi
+if [[ -z "${REAL_PYTHON3:-}" || ! -f "$REAL_PYTHON3" || ! -x "$REAL_PYTHON3" || "$REAL_PYTHON3" -ef "${BASH_SOURCE[0]}" ]]; then
+    # Bash 3.2 can resolve command -v -p back to this shim; skip it explicitly.
+    REAL_PYTHON3=""
+    shim_search_path="${PATH:-}"
+    while :; do
+        shim_directory="${shim_search_path%%:*}"
+        shim_candidate="${shim_directory:-.}/python3"
+        if [[ -f "$shim_candidate" && -x "$shim_candidate" && ! "$shim_candidate" -ef "${BASH_SOURCE[0]}" ]]; then
+            REAL_PYTHON3="$shim_candidate"
+            break
+        fi
+        [[ "$shim_search_path" == *:* ]] || break
+        shim_search_path="${shim_search_path#*:}"
+    done
+fi
+[[ -n "$REAL_PYTHON3" ]] || { echo 'fake python3: no real interpreter found in PATH' >&2; exit 127; }
+exec "$REAL_PYTHON3" "$@"

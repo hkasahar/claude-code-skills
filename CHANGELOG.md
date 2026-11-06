@@ -3,6 +3,18 @@
 All notable changes to this project are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.4.0] — 2026-11-06
+
+### Changed
+
+- Refresh both skill packages from maintained sources using a reviewed public-file allowlist.
+- Reconcile public review defaults: Codex + Gemini; Grok and Claude are explicit additions. Output slots are Codex/Grok/Gemini/Claude, with an empty disabled Grok slot. Ambiguous older two-output calls are rejected before dispatch.
+- Refuse retired DeepSeek reserve/shadow voting. Single-task paid credit fallback remains off unless deliberately selected and configured.
+- Add offline-first preflight and isolated synthetic test/release checks. No live provider access is implied by offline success.
+- Add PDF chunk audits, bounded repair, deadlines, explicit status sidecars, failure-output preservation, and per-document Mathpix page reservations/caps.
+- Keep reference synchronization opt-in and resolve bundled sibling tools from their installation location.
+- Replace attributed slide distribution with generic guidance on plan review, source verification, testing, publication privacy, and context handoff. Earlier releases describe historical behavior and may remain accessible in Git history.
+
 ## [0.3.0] — 2026-07-07
 
 ### Changed — `delegate` plugin v0.2.0: independent Claude delegate under OAuth

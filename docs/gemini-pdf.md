@@ -1,101 +1,57 @@
-# gemini-pdf — PDF → clean Markdown
+# PDF to Markdown with audits
 
-`gemini-pdf` converts PDFs (especially academic papers) into clean Markdown with reconstructed **LaTeX math**, section hierarchy, tables, theorems, and bibliography. The default **native pipeline** feeds page-range chunk PDFs directly to Gemini's vision pathway — **Antigravity CLI (`agy`)** reads the PDF itself, so math layout, column order, and table geometry are seen as rendered rather than guessed back from lossy text extraction. Each converted chunk is validated (nonce end-sentinel, size guards), retried and bisected on failure, scored across seven quality dimensions, and can fall back automatically to a **Mathpix-hybrid** or **Mathpix-standalone** conversion.
+The converter sends page-range PDFs to the selected external model service, checks deterministic fidelity indicators, audits chunks, attempts bounded repair, and marks unresolved results. Neither a passing score nor an AI audit establishes perfect transcription. Its confidentiality messages are warnings, without blocking an upload; authorize the actual document disclosure first.
 
-> The skill folder is named `gemini-pdf` for backward compatibility with the `/gemini-pdf` command; internally it drives Antigravity (`agy`), Google's successor to the original Gemini CLI.
+## Prerequisites and installation
 
-## Prerequisites
+Use an authenticated compatible `agy`, Python 3, Poppler, and pypdf. Mathpix additionally uses requests and your own credentials; the legacy text pipeline can use optional markitdown. See [setup](SETUP.md) and the public [requirements](../skills/gemini-pdf/requirements.txt). Local model spikes, caches, and weight manifests are excluded.
 
-You need Antigravity CLI plus a couple of local tools:
+Install with `/plugin install gemini-pdf@kasahara-skills` after adding the marketplace, or use the scripts in a clone. The [skill entrypoint](../skills/gemini-pdf/SKILL.md) describes the full interface.
 
-```bash
-# 1. Antigravity CLI (the converter) — see docs/SETUP.md for the full walkthrough + the curl|bash explainer
-curl -fsSL https://antigravity.google/cli/install.sh | bash
-agy            # run once to sign in with your Google account
-
-# 2. PDF tooling (required for the native pipeline)
-brew install poppler            # pdfinfo (page count), pdftotext (source text for quality checks)
-pip install pypdf               # page-range splitter (falls back to poppler's pdfseparate/pdfunite)
-
-# 3. Optional
-pip install markitdown          # alternative extractor for the legacy text pipeline
-pip install requests            # required by the Mathpix hybrid/fallback paths
-#   and set MATHPIX_APP_ID / MATHPIX_APP_KEY in your environment for Mathpix
-```
-
-If you already followed **[docs/SETUP.md](SETUP.md)** for the `delegate` skill, you have `agy` + Claude Code installed already — you only need `poppler` and `pypdf` here.
-
-### Model setup
-
-`agy` ≥ 1.0.5 has a working `--model` flag; the script passes **"Gemini 3.1 Pro (High)"** by default (override with `GEMINI_PDF_MODEL`). If your `agy` build lacks the flag, the model from `~/.gemini/antigravity-cli/settings.json` is used instead. List current model names with `agy models` — they change over time.
-
-### Concurrency note (important)
-
-Concurrent `agy --print` processes hang (verified live on agy 1.0.16). The script serializes every `agy` call under a global lock and wraps each in a watchdog that kills the whole process group on timeout. If you launch several conversions at once they will queue automatically — that is by design, not a bug.
-
-## Install
-
-Via the plugin marketplace (recommended):
-
-```text
-/plugin marketplace add hkasahar/claude-code-skills
-/plugin install gemini-pdf@kasahara-skills
-```
-
-Or copy manually into `~/.claude/skills/gemini-pdf/` (see the repo [README](../README.md)).
-
-## Usage
+## Conservative first run
 
 ```bash
-GEMINI_PDF="${CLAUDE_PLUGIN_ROOT:+$CLAUDE_PLUGIN_ROOT/skills/gemini-pdf}"
-GEMINI_PDF="${GEMINI_PDF:-$HOME/.claude/skills/gemini-pdf}"
-
-# Basic — native pipeline, writes paper.md next to paper.pdf
-bash "$GEMINI_PDF/scripts/pdf_to_markdown.sh" paper.pdf
-
-# Choose output path / pipeline / disable chunking
-bash "$GEMINI_PDF/scripts/pdf_to_markdown.sh" paper.pdf out.md --pipeline text
-bash "$GEMINI_PDF/scripts/pdf_to_markdown.sh" paper.pdf --no-chunk
-
-# Mathpix math-OCR + agy structural cleanup (hybrid)
-bash "$GEMINI_PDF/scripts/pdf_to_markdown.sh" paper.pdf --hybrid
-
-# Mathpix standalone (works without agy)
-bash "$GEMINI_PDF/scripts/pdf_to_markdown.sh" scan.pdf --force-mathpix
+GEMINI_PDF="$PWD/skills/gemini-pdf"
+bash "$GEMINI_PDF/scripts/pdf_to_markdown.sh" paper.pdf paper.md \
+  --mathpix-page-cap 0 --strict
 ```
 
-In practice you just ask Claude Code ("convert this paper to markdown") and it runs the script. See **[../skills/gemini-pdf/SKILL.md](../skills/gemini-pdf/SKILL.md)** for every flag, environment variable, the chunking/retry strategy, the fallback chain, and the quality-scoring rubric.
+The page cap of zero disables Mathpix dispatches, including paid escalation. The native model path is still external. Output goes to the requested path; stdout reports the produced Markdown path. Use `--audit-model`, `GEMINI_PDF_MODEL`, and `GEMINI_PDF_AUDIT_MODEL` only after checking supported IDs. Configured IDs and offline fixtures do not prove live availability.
 
-Alongside `output.md` the script may write `output.err` (per-chunk agy stderr), `output.meta.json` (per-chunk ledger), `output.quality.json` (quality report), and `output.attempt-<stage>.md` (losing fallback attempts kept for manual override).
+Conversion calls are serialized under a shared lock and bounded by watchdogs. A deadline can skip audit/repair stages; skipped work remains visible in the final report. The audited default deadline is 3300 seconds with a 120-second publication reserve. Long jobs need an appropriate execution and cost plan.
 
-## Optional: reference library sync
+## Read the status before ingesting
 
-The skill can additionally file each converted paper into a personal "reference library" (`pdf/`, `md/`, and a `reference.bib`). **This is off by default** and is only useful if you keep such a library.
+| Result | Default exit | Strict exit | Meaning |
+| --- | --- | --- | --- |
+| verified | 0 | 0 | Packaged checks completed without unresolved findings |
+| degraded | 0 | 3 | At least one audit/check is unavailable or skipped |
+| partial | 0 | 4 | Unresolved chunks remain and are marked |
+| failed | 2 | 2 | A chunk/run failed; the intended normal output is not trustworthy |
+| disabled audit | 0 | 0 | Audit was deliberately disabled; do not describe it as verified |
 
-To enable it, point `GEMINI_PDF_REFERENCE_DIR` at an existing directory:
+Usage/environment failures use exit 1. Default exit zero does not imply verified status. On audited failure, best effort is written as `output.failed.md`; a pre-existing normal output is preserved under a run-specific `.pre-...` name. The stdout path may therefore name failed output. Inspect `output.audit.json` and residual markers.
+
+Sidecars can include `.err`, `.meta.json`, `.quality.json`, `.audit.json`, and a detail directory for nonverified chunks. These may contain document text, paths, model responses, and operational data; keep them local unless separately reviewed for release.
+
+## Optional paid OCR
+
+Mathpix escalation requires credentials. The default page cap is 20 per document over the ledger's 24-hour window; zero disables it. Reservations count dispatches even when their final outcome is uncertain, preventing a failed request from silently freeing spend allowance. A cap is a limit, not consent.
+
+The reported per-page dollar amount is an estimate controlled by configuration, not a current price quote. Use the provider's current terms, approve the actual upload/cost, and inspect the ledger and report. Explicit Mathpix/hybrid modes still pass through the page-cap guard.
+
+## Optional local reference synchronization
+
+There is no personal library default. Set an explicit destination and a citation key only if you want a local library write:
 
 ```bash
-export GEMINI_PDF_REFERENCE_DIR="$HOME/research/reference"   # your own path
-bash "$GEMINI_PDF/scripts/pdf_to_markdown.sh" paper.pdf --bib-key smith-2020-aer
+export GEMINI_PDF_REFERENCE_DIR="$HOME/reference-library"
+bash "$GEMINI_PDF/scripts/pdf_to_markdown.sh" paper.pdf paper.md \
+  --bib-key example2026 --mathpix-page-cap 0
 ```
 
-If `GEMINI_PDF_REFERENCE_DIR` is unset (or points to a directory that doesn't exist), the sync step is skipped entirely and nothing is written outside your chosen output path. There is **no default path** — the feature never touches your filesystem unless you opt in. BibTeX metadata comes from a JSON sidecar when present, otherwise from the converted file's own YAML front matter. Copies are skip-if-exists; `--force-sync` overwrites a previously synced (worse) conversion.
+`REFERENCE_DIR` is an alternative explicit setting. Without a destination, the sync helper refuses to infer one. Inspect existing entries before selecting `--force-sync`. Strict mode changes exit codes; it does not by itself prevent a requested synchronization of partial/degraded output. Consumers requiring verified-only ingestion must inspect the audit status and control sync accordingly.
 
-## Troubleshooting
+## Tests
 
-| Problem | Fix |
-|---|---|
-| `agy not found` | `curl -fsSL https://antigravity.google/cli/install.sh \| bash`; ensure `~/.local/bin` is on your `PATH` |
-| `Authentication required` from `agy` | run `agy` once interactively and complete the Google sign-in |
-| Conversion slow / seems queued | agy calls serialize under a global lock by design (concurrent agy hangs); ~1-4 min per 10-page chunk is normal |
-| `ModuleNotFoundError: requests` (Mathpix path) | `pip install requests` |
-| Math still garbled | confirm the model (`GEMINI_PDF_MODEL`); try `--hybrid` for Mathpix math OCR |
-| `<!-- CHUNK N FAILED -->` in output | that page range failed after retries + bisection; raise `GEMINI_PDF_TIMEOUT` and re-run |
-| Scanned PDF, empty/garbled output | the native pipeline reads scans; `--force-mathpix` is the alternative |
-| Low quality score | inspect `output.quality.json`; try `--hybrid` or `--force-mathpix` |
-
-More in **[../skills/gemini-pdf/SKILL.md](../skills/gemini-pdf/SKILL.md)**.
-
----
-
-Model names, flags, and prices change; treat the values here as dated snapshots and verify the current ones for your tools.
+The [isolated repository launcher](../scripts/run_offline_tests.py) uses synthetic fixtures and fail-closed external-command stubs. Unit tests cover audit parsing/scoring, page accounting, failed outputs, and opt-in synchronization; offline scenarios exercise conversion/repair/deadline/cap behavior. No model inference, document upload, paid OCR, or private library is required.

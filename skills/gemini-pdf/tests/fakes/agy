@@ -1,0 +1,4 @@
+#!/bin/bash
+# Bash 3.2 entry point; the deterministic protocol and JSON handling use stdlib.
+set -eu
+exec python3 "$(dirname "$0")/agy_impl.py" "$@"

@@ -1,0 +1,19 @@
+#!/bin/bash
+# The suite discovers the real binary before prepending this fakes directory.
+set -eu
+# Report-mode failure begins only when settings assembly is reached; all
+# prior state-writing calls remain real. Subsequent calls stay dead too.
+if [[ "${FAKE_JQ_FAIL:-0}" == report ]]; then
+    previous=""
+    for argument in "$@"; do
+        if [[ "$previous" == --argjson && "$argument" == enabled ]]; then
+            : > "${TMPDIR:?}/fake-jq-report-failure"
+        fi
+        previous="$argument"
+    done
+fi
+if [[ "${FAKE_JQ_FAIL:-0}" == 1 || ( "${FAKE_JQ_FAIL:-0}" == report && -f "${TMPDIR:?}/fake-jq-report-failure" ) ]]; then
+    echo 'fake jq: injected failure' >&2
+    exit 1
+fi
+exec "${FAKE_REAL_JQ:?offline suite must set FAKE_REAL_JQ}" "$@"
